@@ -25,11 +25,6 @@ export default defineConfig({
           generate: false,
           singleton: true,
         },
-        'vuetify/styles': {
-          requiredVersion: false,
-          generate: false,
-          singleton: true,
-        },
       },
       format: 'esm',
     }),

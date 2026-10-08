@@ -1,8 +1,13 @@
 <script setup>
 import { computed, inject, onMounted, onUnmounted, ref, watch } from 'vue'
 import TaskEditorDialog from './TaskEditorDialog.vue'
+import GlobalDeletePolicy from './GlobalDeletePolicy.vue'
+import PolicyText from './PolicyText.vue'
 import {
   cloneTask,
+  globalDeleteRules,
+  globalDeleteSummary,
+  torrentStateLabel,
   formatBytes,
   formatDateTime,
   formatDuration,
@@ -21,12 +26,10 @@ const props = defineProps({
 })
 
 const emit = defineEmits(['close', 'action'])
-const loading = ref(true)
+const loading = ref(false)
 const taskLoading = ref(false)
 const saving = ref(false)
 const error = ref('')
-// 首次状态请求完成前，不把默认的停用状态展示给用户。
-const statusLoaded = ref(false)
 const status = ref({
   enabled: false,
   show_sidebar_nav: true,
@@ -44,9 +47,19 @@ const editorTask = ref(cloneTask())
 const deleteDialog = ref(false)
 const clearDialog = ref(false)
 const settingsMenu = ref(false)
+const policyOpen = ref(false)
 const settingsDraft = ref({
   enabled: false,
   show_sidebar_nav: true,
+  global_min_seed_hours: null,
+  global_inactive_hours: null,
+  global_seed_ratio: null,
+  global_seed_size: null,
+  global_download_time: null,
+  global_seed_avgspeed: null,
+  global_hr_seed_time: null,
+  global_del_no_free: false,
+  global_delete_except_tags: "MOVIEPILOT,H&R",
   global_disksize: null,
   global_maxdlcount: null,
   global_maxupspeed: null,
@@ -117,10 +130,18 @@ async function loadStatus({ preserveSelection = true, loadDetail = true } = {}) 
   try {
     const data = unwrapResponse(await props.api.get(`${pluginBase.value}/status`))
     status.value = data || status.value
-    statusLoaded.value = true
     settingsDraft.value = {
       enabled: Boolean(status.value.enabled),
       show_sidebar_nav: status.value.show_sidebar_nav !== false,
+      global_min_seed_hours: status.value.global_min_seed_hours ?? null,
+      global_inactive_hours: status.value.global_inactive_hours ?? null,
+      global_seed_ratio: status.value.global_seed_ratio ?? null,
+      global_seed_size: status.value.global_seed_size ?? null,
+      global_download_time: status.value.global_download_time ?? null,
+      global_seed_avgspeed: status.value.global_seed_avgspeed ?? null,
+      global_hr_seed_time: status.value.global_hr_seed_time ?? null,
+      global_del_no_free: Boolean(status.value.global_del_no_free),
+      global_delete_except_tags: status.value.global_delete_except_tags ?? "MOVIEPILOT,H&R",
       global_disksize: status.value.global_disksize ?? null,
       global_maxdlcount: status.value.global_maxdlcount ?? null,
       global_maxupspeed: status.value.global_maxupspeed ?? null,
@@ -247,6 +268,7 @@ async function saveSettings() {
     const payload = normalizeSettings(settingsDraft.value)
     status.value = unwrapResponse(await props.api.post(`${pluginBase.value}/settings`, payload))
     settingsMenu.value = false
+    policyOpen.value = false
     await loadStatus()
     notify('全局设置已保存')
   } catch (err) {
@@ -302,20 +324,38 @@ async function changeTorrentPage(value) {
   await loadTaskDetail()
 }
 
+const globalRuleText = computed(() => globalDeleteRules(status.value, taskConfig.value))
+const taskDeletePolicy = computed(() => {
+  if (status.value.global_proxy_delete) {
+    if (!taskConfig.value.proxy_delete) return '不参与全局托管'
+    const [low, high] = String(status.value.global_delete_size_range || '').split('-')
+    return `容量达到 ${high || low || '未设置'} GB 时开始清理，降至 ${low || '未设置'} GB 停止。${globalRuleText.value}，满足任意一项适用条件即可参与清理。共用文件逐个检查，H&R 和保护标签优先。`
+  }
+  if (status.value.guarded_delete_enabled) return '全局托管未开启，暂停自动删除'
+  return taskConfig.value.proxy_delete ? `任务动态清理，${taskConfig.value.delete_size_range || '未设置阈值'} GB` : '普通模式，满足任一条件'
+})
+
 // 根据配置生成当前种子的下一项处理条件摘要。
 function torrentPolicy(item) {
-  if (item.deleted) return '已删除'
+  if (item.deleted) return item.delete_reason || '已删除'
+  if (status.value.global_proxy_delete) return item.hit_and_run ? `${taskDeletePolicy.value}。H&R 使用独立时间或分享率条件，保护标签仍优先。` : taskDeletePolicy.value
   if (item.hit_and_run && taskConfig.value.hr_seed_time) return `H&R ${taskConfig.value.hr_seed_time} 小时`
   if (taskConfig.value.seed_time) return `${taskConfig.value.seed_time} 小时后检查`
   if (taskConfig.value.seed_ratio) return `分享率 ${taskConfig.value.seed_ratio}`
   return taskConfig.value.proxy_delete ? '动态删种托管' : '等待删除条件'
 }
 
-// 返回种子当前下载或做种状态文本。
-function torrentStateText(item) {
-  const progress = torrentProgress(item)
-  if (item.deleted) return '已删除'
-  return progress >= 100 ? '做种' : `下载 ${progress}%`
+// Status labels never contain policy descriptions or deletion reasons.
+const torrentStateText = torrentStateLabel
+const taskPolicyShort = computed(() => {
+  if (status.value.global_proxy_delete) return taskConfig.value.proxy_delete ? globalDeleteSummary(status.value, taskConfig.value) : '不参与全局托管'
+  if (status.value.guarded_delete_enabled) return '暂停自动删除'
+  return taskConfig.value.proxy_delete ? '任务动态清理' : '满足任一条件'
+})
+function torrentPolicyShort(item) {
+  if (item.deleted) return '查看删除原因'
+  if (item.hit_and_run) return 'H&R 条件与保护规则'
+  return taskPolicyShort.value
 }
 
 // 将站点分享率状态格式化为当前值、无限或暂无数据。
@@ -335,7 +375,7 @@ watch(
 onMounted(async () => {
   await loadStatus({ preserveSelection: false })
   refreshTimer = window.setInterval(() => {
-    if (!editorOpen.value && document.visibilityState === 'visible') loadStatus()
+    if (!editorOpen.value && !policyOpen.value && !settingsMenu.value && document.visibilityState === 'visible') loadStatus()
   }, 30000)
 })
 
@@ -360,6 +400,7 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
         <VChip v-if="status.summary.task_count" size="small" variant="tonal">
           {{ status.summary.running_count ?? status.summary.enabled_count ?? 0 }} / {{ status.summary.task_count }} 运行
         </VChip>
+        <VBtn prepend-icon="mdi-delete-clock-outline" variant="tonal" @click="policyOpen = true">全局删除策略</VBtn>
         <VMenu v-model="settingsMenu" :close-on-content-click="false" location="bottom end">
           <template #activator="{ props: menuProps }">
             <VBtn v-bind="menuProps" icon="mdi-tune-variant" variant="text" aria-label="全局设置" />
@@ -375,30 +416,6 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
                 inset
               />
               <VDivider />
-              <VSwitch
-                v-model="settingsDraft.global_proxy_delete"
-                label="全局动态删种"
-                color="primary"
-                hide-details
-                inset
-              />
-              <VTextField
-                v-if="settingsDraft.global_proxy_delete"
-                v-model="settingsDraft.global_delete_size_range"
-                label="全局动态删种阈值（GB）"
-                placeholder="50-100"
-                clearable
-                hide-details
-              />
-              <VDivider />
-              <VTextField
-                v-model.number="settingsDraft.global_disksize"
-                type="number"
-                min="0"
-                label="全局保种体积（GB）"
-                clearable
-                hide-details
-              />
               <VTextField
                 v-model.number="settingsDraft.global_maxdlcount"
                 type="number"
@@ -435,7 +452,7 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
     </header>
 
     <VAlert v-if="error" type="error" variant="tonal" closable @click:close="error = ''">{{ error }}</VAlert>
-    <VAlert v-if="statusLoaded && !status.enabled" type="warning" variant="tonal">
+    <VAlert v-if="!status.enabled" type="warning" variant="tonal">
       插件当前未启用，任务配置与历史仍可查看，启用后才会注册刷新和检查服务。
     </VAlert>
 
@@ -605,7 +622,7 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
                     <div v-if="taskConfig.site_ratio_control"><dt>站点分享率</dt><dd>{{ formatSiteRatio(selectedTask.site_ratio) }} / {{ Number(taskConfig.site_ratio_target || 0).toFixed(2) }}</dd></div>
                     <div><dt>选种来源</dt><dd>{{ taskConfig.rss_support ? 'RSS' : '站点列表页' }}</dd></div>
                     <div><dt>促销要求</dt><dd>{{ taskConfig.freeleech === '2xfree' ? '2X 免费' : taskConfig.freeleech === 'free' ? '免费' : '全部' }}</dd></div>
-                    <div><dt>删种策略</dt><dd>{{ taskConfig.proxy_delete ? `动态 ${taskConfig.delete_size_range || '-' } GB` : '满足任一条件' }}</dd></div>
+                    <div><dt>删种策略</dt><dd><PolicyText :short="taskPolicyShort" :full="taskDeletePolicy" /></dd></div>
                   </dl>
                 </VSheet>
 
@@ -674,7 +691,7 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
                   <template #item.size="{ item }">{{ formatBytes(item.size) }}</template>
                   <template #item.uploaded="{ item }">{{ formatBytes(item.uploaded) }}</template>
                   <template #item.ratio="{ item }">{{ Number(item.ratio || 0).toFixed(2) }}</template>
-                  <template #item.policy="{ item }">{{ torrentPolicy(item) }}</template>
+                  <template #item.policy="{ item }"><PolicyText :short="torrentPolicyShort(item)" :full="torrentPolicy(item)" /></template>
                   <template #no-data>
                     <div class="brushflow-table-empty">当前筛选下没有种子记录</div>
                   </template>
@@ -835,6 +852,12 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
       </div>
     </template>
 
+    <GlobalDeletePolicy
+      v-model="policyOpen"
+      :draft="settingsDraft"
+      :saving="saving"
+      @save="settingsDraft = $event; saveSettings()"
+    />
     <TaskEditorDialog
       v-model="editorOpen"
       :task="editorTask"

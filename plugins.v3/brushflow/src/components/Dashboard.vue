@@ -8,6 +8,8 @@ const props = defineProps({
   allowRefresh: { type: Boolean, default: true },
 })
 
+const attrs = computed(() => props.config?.attrs || {})
+const error = ref('')
 const loading = ref(false)
 const status = ref({ summary: {}, tasks: [] })
 let refreshTimer
@@ -16,10 +18,13 @@ const runningTasks = computed(() => (status.value.tasks || []).filter(item => it
 
 // 从插件接口加载仪表板聚合统计。
 async function loadStatus() {
-  if (!props.allowRefresh && status.value.tasks?.length) return
+  if (loading.value || (!props.allowRefresh && status.value.tasks?.length)) return
   loading.value = true
   try {
     status.value = unwrapResponse(await props.api.get('plugin/BrushFlow/status')) || status.value
+    error.value = ''
+  } catch (err) {
+    error.value = err?.message || '暂时无法加载刷流状态'
   } finally {
     loading.value = false
   }
@@ -43,7 +48,18 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="brushflow-dashboard">
+  <VCard class="brushflow-dashboard" :flat="attrs.border === false" :loading="loading">
+    <VCardItem class="brushflow-dashboard__header">
+      <template #prepend>
+        <VAvatar color="primary" variant="tonal" size="36">
+          <VIcon icon="mdi-swap-vertical-bold" size="20" />
+        </VAvatar>
+      </template>
+      <VCardTitle class="brushflow-dashboard__title">{{ attrs.title || '站点刷流' }}</VCardTitle>
+      <VCardSubtitle>{{ attrs.subtitle || '多任务运行概览' }}</VCardSubtitle>
+    </VCardItem>
+    <VCardText class="brushflow-dashboard__body">
+    <VAlert v-if="error" type="warning" variant="tonal" density="compact">{{ error }}</VAlert>
     <div class="brushflow-dashboard__metrics">
       <div><span>运行任务</span><strong>{{ status.summary.running_count ?? status.summary.enabled_count ?? 0 }} / {{ status.summary.task_count || 0 }}</strong></div>
       <div><span>活跃种子</span><strong>{{ status.summary.active_count || 0 }}</strong></div>
@@ -54,30 +70,59 @@ onUnmounted(() => {
     <div class="brushflow-dashboard__tasks">
       <div v-for="task in runningTasks" :key="task.id">
         <VIcon :icon="taskStateMeta(task.state).icon" :color="taskStateMeta(task.state).color" size="18" />
-        <div><strong>{{ task.name }}</strong><span>{{ task.site_name }} · {{ task.statistic.active || 0 }} 个种子</span></div>
-        <span>{{ formatBytes(task.statistic.uploaded) }}</span>
+        <div><strong>{{ task.name }}</strong><span>{{ task.site_name }} · {{ task.statistic?.active || 0 }} 个种子</span></div>
+        <span class="brushflow-dashboard__uploaded">{{ formatBytes(task.statistic?.uploaded) }}</span>
       </div>
       <div v-if="!runningTasks.length" class="brushflow-dashboard__empty">
         <VIcon icon="mdi-sync-off" />
         暂无启用的刷流任务
       </div>
     </div>
-    <VProgressLinear v-if="loading" indeterminate color="primary" height="2" />
-  </div>
+    </VCardText>
+  </VCard>
 </template>
 
 <style scoped>
 .brushflow-dashboard {
   display: flex;
   flex-direction: column;
+  inline-size: 100%;
+  block-size: 100%;
+  min-inline-size: 0;
+  min-block-size: 0;
+  overflow: hidden;
+  container-type: inline-size;
+}
+
+.brushflow-dashboard__header {
+  flex: 0 0 auto;
+  padding-block-end: 8px;
+}
+
+.brushflow-dashboard__title {
+  font-size: 1rem;
+  line-height: 1.35;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.brushflow-dashboard__body {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
   gap: 14px;
   min-inline-size: 0;
+  min-block-size: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding-block-start: 8px;
 }
 
 .brushflow-dashboard__metrics {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
+  flex: 0 0 auto;
 }
 
 .brushflow-dashboard__metrics > div {
@@ -102,6 +147,7 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  flex: 0 0 auto;
 }
 
 .brushflow-dashboard__tasks > div {
@@ -117,19 +163,33 @@ onUnmounted(() => {
   min-inline-size: 0;
 }
 
-.brushflow-dashboard__tasks strong {
+.brushflow-dashboard__tasks strong,
+.brushflow-dashboard__tasks span {
   overflow-wrap: anywhere;
 }
 
-.brushflow-dashboard__empty {
+.brushflow-dashboard__uploaded {
+  white-space: nowrap;
+  text-align: end;
+}
+
+.brushflow-dashboard__tasks > .brushflow-dashboard__empty {
+  display: flex;
   justify-content: center;
   padding-block: 18px;
   color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity));
 }
 
-@media (max-width: 599px) {
+@container (min-width: 480px) {
   .brushflow-dashboard__metrics {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+@container (max-width: 280px) {
+  .brushflow-dashboard__uploaded {
+    grid-column: 2;
+    text-align: start;
   }
 }
 </style>

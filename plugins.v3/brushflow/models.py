@@ -46,6 +46,7 @@ class BrushTaskPayload(BaseModel):
     seeder: Optional[str] = None
     timezone_offset: float = 0
     pubtime: Optional[str] = None
+    min_seed_hours: Optional[float] = Field(None, gt=0, allow_inf_nan=False)
     seed_time: Optional[float] = Field(None, gt=0)
     hr_seed_time: Optional[float] = Field(None, gt=0)
     seed_ratio: Optional[float] = Field(None, gt=0)
@@ -61,7 +62,7 @@ class BrushTaskPayload(BaseModel):
     delete_except_tags: Optional[str] = None
     except_subscribe: bool = True
     proxy_delete: bool = False
-    del_no_free: bool = False
+    del_no_free: Optional[bool] = None
     qb_category: Optional[str] = None
     site_hr_active: bool = False
     site_skip_tips: bool = False
@@ -74,6 +75,7 @@ class BrushTaskPayload(BaseModel):
         "maxdlspeed",
         "maxdlcount",
         "site_ratio_target",
+        "min_seed_hours",
         "seed_time",
         "hr_seed_time",
         "seed_ratio",
@@ -181,6 +183,15 @@ class BrushFlowSettingsPayload(BaseModel):
     刷流插件全局设置请求模型
     """
 
+    global_seed_ratio: Optional[float] = Field(None, gt=0, allow_inf_nan=False)
+    global_seed_size: Optional[float] = Field(None, gt=0, allow_inf_nan=False)
+    global_download_time: Optional[float] = Field(None, gt=0, allow_inf_nan=False)
+    global_seed_avgspeed: Optional[float] = Field(None, gt=0, allow_inf_nan=False)
+    global_hr_seed_time: Optional[float] = Field(None, gt=0, allow_inf_nan=False)
+    global_del_no_free: bool = False
+    global_delete_except_tags: str = "MOVIEPILOT,H&R"
+    global_inactive_hours: Optional[float] = Field(None, gt=0, allow_inf_nan=False)
+    global_min_seed_hours: Optional[float] = Field(None, gt=0, allow_inf_nan=False)
     enabled: bool = True
     show_sidebar_nav: bool = True
     global_disksize: Optional[float] = Field(None, gt=0)
@@ -204,6 +215,14 @@ class BrushFlowSettingsPayload(BaseModel):
         return normalized
 
     @field_validator(
+        "global_min_seed_hours",
+        "global_inactive_hours",
+        "global_seed_ratio",
+        "global_seed_size",
+        "global_download_time",
+        "global_seed_avgspeed",
+        "global_hr_seed_time",
+
         "global_disksize",
         "global_maxdlcount",
         "global_maxupspeed",
@@ -241,4 +260,8 @@ class BrushFlowSettingsPayload(BaseModel):
         """启用全局动态删种时要求配置有效体积阈值。"""
         if self.global_proxy_delete and not self.global_delete_size_range:
             raise ValueError("启用全局动态删种时必须设置动态删种阈值")
+        if (self.global_proxy_delete and (self.global_min_seed_hours or self.global_inactive_hours or self.global_del_no_free
+                                              or any(getattr(self, field) for field in ('global_seed_ratio', 'global_seed_size', 'global_download_time', 'global_seed_avgspeed', 'global_hr_seed_time')))
+                and "-" not in self.global_delete_size_range):
+            raise ValueError("全局删除策略需分别设置开始清理和停止清理容量")
         return self

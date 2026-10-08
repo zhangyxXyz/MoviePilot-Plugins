@@ -23,6 +23,7 @@ export const taskDefaults = {
   seeder: null,
   timezone_offset: 0,
   pubtime: null,
+  min_seed_hours: null,
   seed_time: null,
   hr_seed_time: null,
   seed_ratio: null,
@@ -38,12 +39,11 @@ export const taskDefaults = {
   delete_except_tags: null,
   except_subscribe: true,
   proxy_delete: false,
-  del_no_free: false,
+  del_no_free: null,
   qb_category: null,
   site_hr_active: false,
   site_skip_tips: false,
   rss_support: false,
-  tag: null,
 }
 
 /** 统一提取宿主 API 客户端与标准响应模型中的业务数据。 */
@@ -69,6 +69,7 @@ export function normalizeTask(task) {
     'maxdlspeed',
     'maxdlcount',
     'site_ratio_target',
+    'min_seed_hours',
     'seed_time',
     'hr_seed_time',
     'seed_ratio',
@@ -92,7 +93,6 @@ export function normalizeTask(task) {
     'save_path',
     'delete_except_tags',
     'qb_category',
-    'tag',
   ]
   nullableNumbers.forEach(key => {
     const value = result[key] === '' || result[key] === null ? null : Number(result[key])
@@ -111,7 +111,7 @@ export function normalizeTask(task) {
 /** 把全局设置中的空值、零值和正数标准化为后端请求类型。 */
 export function normalizeSettings(settings = {}) {
   const result = { ...(settings || {}) }
-  const limitFields = ['global_disksize', 'global_maxdlcount', 'global_maxupspeed', 'global_maxdlspeed']
+  const limitFields = ['global_min_seed_hours', 'global_inactive_hours', 'global_seed_ratio', 'global_seed_size', 'global_download_time', 'global_seed_avgspeed', 'global_hr_seed_time', 'global_disksize', 'global_maxdlcount', 'global_maxupspeed', 'global_maxdlspeed']
   limitFields.forEach(key => {
     const value = Number(result[key] || 0)
     result[key] = value > 0 ? value : null
@@ -174,4 +174,58 @@ export function torrentProgress(item) {
   const size = Number(item?.size || 0)
   if (!size) return 0
   return Math.min(Math.round((Number(item.downloaded || 0) * 100) / size), 100)
+}
+
+/** Keep torrent status independent from deletion policy. */
+export function torrentStateLabel(item) {
+  if (item.deleted) return '已删除'
+  const progress = torrentProgress(item)
+  return progress >= 100 ? '做种中' : `下载中 ${progress}%`
+}
+
+/** Task values replace corresponding global fields; blanks inherit. */
+export function effectiveDeleteSettings(settings = {}, task = {}) {
+  const result = { ...settings }
+  for (const key of ['seed_ratio', 'seed_size', 'download_time', 'seed_avgspeed', 'hr_seed_time', 'del_no_free', 'delete_except_tags']) {
+    if (task[key] !== null && task[key] !== undefined && task[key] !== '') result[`global_${key}`] = task[key]
+  }
+  result.global_min_seed_hours = task.min_seed_hours ?? task.seed_time ?? settings.global_min_seed_hours
+  if (task.seed_inactivetime != null && task.seed_inactivetime !== '') result.global_inactive_hours = Number(task.seed_inactivetime) / 60
+  return result
+}
+
+/** Full explanation used by tooltips and mobile cards. */
+export function globalDeleteRules(settings = {}, task = {}) {
+  settings = effectiveDeleteSettings(settings, task)
+  const rules = []
+  const hours = Number(settings.global_min_seed_hours || 0)
+  if (hours > 0) rules.push(`累计做种 ${hours} 小时`)
+  if (Number(settings.global_inactive_hours) > 0) rules.push(`未活动 ${settings.global_inactive_hours} 小时`)
+  if (Number(settings.global_seed_ratio) > 0) rules.push(`分享率达到 ${settings.global_seed_ratio}`)
+  if (Number(settings.global_seed_size) > 0) rules.push(`上传量达到 ${settings.global_seed_size} GB`)
+  if (Number(settings.global_download_time) > 0) rules.push(`未完成下载超过 ${settings.global_download_time} 小时`)
+  if (Number(settings.global_seed_avgspeed) > 0) rules.push(`平均上传速度低于 ${settings.global_seed_avgspeed} KB/s`)
+  if (settings.global_del_no_free) rules.push('促销过期且下载未完成')
+  let text = rules.join(' 或 ') || '未配置普通种子条件'
+  if (Number(settings.global_hr_seed_time) > 0) text += `。H&R 种子单独判断，累计做种 ${settings.global_hr_seed_time} 小时或达到分享率目标`
+  return text
+}
+
+/** Compact summary follows the configured criteria, without rounding durations. */
+export function globalDeleteSummary(settings = {}, task = {}) {
+  settings = effectiveDeleteSettings(settings, task)
+  const duration = value => Number(value) % 24 === 0 ? `${Number(value) / 24}天` : `${Number(value)}小时`
+  const rules = []
+  const hours = Number(settings.global_min_seed_hours || 0)
+  if (hours > 0) rules.push(duration(hours))
+  if (Number(settings.global_inactive_hours) > 0) rules.push(`闲置${duration(settings.global_inactive_hours)}`)
+  if (Number(settings.global_seed_ratio) > 0) rules.push(`分享率≥${settings.global_seed_ratio}`)
+  if (Number(settings.global_seed_size) > 0) rules.push(`上传≥${settings.global_seed_size}GB`)
+  if (Number(settings.global_download_time) > 0) rules.push(`下载超时${duration(settings.global_download_time)}`)
+  if (Number(settings.global_seed_avgspeed) > 0) rules.push(`均速≤${settings.global_seed_avgspeed}KB/s`)
+  if (settings.global_del_no_free) rules.push('促销过期')
+  let summary = rules.slice(0, 2).join('或')
+  if (rules.length > 2) summary += `等${rules.length}项`
+  if (!summary) summary = Number(settings.global_hr_seed_time) > 0 ? `H&R ${duration(settings.global_hr_seed_time)}` : '按容量清理'
+  return `全局托管 · ${summary}`
 }

@@ -28,6 +28,9 @@ watch(
   visible => {
     if (!visible) return
     localTask.value = cloneTask(props.task)
+    if (props.globalDynamicDelete && localTask.value.min_seed_hours == null) {
+      localTask.value.min_seed_hours = localTask.value.seed_time
+    }
     activeTab.value = 'base'
   },
 )
@@ -41,7 +44,9 @@ function closeDialog() {
 async function saveTask() {
   const result = await formRef.value?.validate()
   if (result && !result.valid) return
-  emit('save', normalizeTask(localTask.value))
+  const payload = normalizeTask(localTask.value)
+  if (props.globalDynamicDelete) payload.seed_time = null // 合并旧时间字段，清空后可真正继承全局
+  emit('save', payload)
 }
 </script>
 
@@ -310,7 +315,7 @@ async function saveTask() {
                       {{ globalDynamicDelete ? '全局删种托管' : '删除模式' }}
                     </div>
                     <div class="text-body-2 text-medium-emphasis">
-                      {{ globalDynamicDelete ? '选择此任务是否参加全局阈值兜底淘汰' : '动态模式会在超过体积阈值后按现有算法托管删种' }}
+                      {{ globalDynamicDelete ? '选择此任务是否参加全局容量清理' : '动态模式会在超过体积阈值后按现有算法托管删种' }}
                     </div>
                   </div>
                 </header>
@@ -329,44 +334,57 @@ async function saveTask() {
                 </VRow>
               </section>
               <section class="editor-section">
+                <VAlert v-if="globalDynamicDelete" type="info" variant="tonal" class="mb-4">每项留空继承全局，填写后覆盖对应全局值。适用的清理条件满足任意一项即可，全局容量阈值、保护标签及关联辅种检查仍需满足。</VAlert>
+
+                <VTextField
+                  v-model.number="localTask.min_seed_hours"
+                  type="number"
+                  min="0.01"
+                  clearable
+                  label="本任务累计做种目标（小时）"
+                  hint="留空继承全局，填写后覆盖全局累计做种目标，与其他适用条件为或关系。"
+                  persistent-hint
+                />
+              </section>
+              <section class="editor-section">
                 <header class="editor-section__head">
                   <div>
                     <div class="text-subtitle-1 font-weight-medium">触发条件</div>
-                    <div class="text-body-2 text-medium-emphasis">普通模式满足任一条件即删除</div>
+                    <div class="text-body-2 text-medium-emphasis">各项留空继承全局，设置则覆盖，满足任一适用条件即可。H&R 单独使用 H&R 时间或分享率。</div>
                   </div>
                 </header>
                 <VRow>
-                  <VCol cols="12" md="4">
-                    <VTextField v-model.number="localTask.seed_time" type="number" min="0" label="做种时间（小时）" />
+                  <VCol v-if="!globalDynamicDelete" cols="12" md="4">
+                    <VTextField v-model.number="localTask.seed_time" type="number" min="0" clearable hint="留空继承全局，填写后覆盖" persistent-hint label="做种时间（小时）" />
                   </VCol>
                   <VCol cols="12" md="4">
-                    <VTextField v-model.number="localTask.hr_seed_time" type="number" min="0" label="H&R 做种时间（小时）" />
+                    <VTextField v-model.number="localTask.hr_seed_time" type="number" min="0" clearable hint="留空继承全局，填写后覆盖" persistent-hint label="H&R 做种时间（小时）" />
                   </VCol>
                   <VCol cols="12" md="4">
-                    <VTextField v-model.number="localTask.seed_ratio" type="number" min="0" label="分享率" />
+                    <VTextField v-model.number="localTask.seed_ratio" type="number" min="0" clearable hint="留空继承全局，填写后覆盖" persistent-hint label="分享率" />
                   </VCol>
                   <VCol cols="12" md="4">
-                    <VTextField v-model.number="localTask.seed_size" type="number" min="0" label="上传量（GB）" />
+                    <VTextField v-model.number="localTask.seed_size" type="number" min="0" clearable hint="留空继承全局，填写后覆盖" persistent-hint label="上传量（GB）" />
                   </VCol>
                   <VCol cols="12" md="4">
-                    <VTextField v-model.number="localTask.download_time" type="number" min="0" label="下载超时（小时）" />
+                    <VTextField v-model.number="localTask.download_time" type="number" min="0" clearable hint="留空继承全局，填写后覆盖" persistent-hint label="下载超时（小时）" />
                   </VCol>
                   <VCol cols="12" md="4">
-                    <VTextField v-model.number="localTask.seed_inactivetime" type="number" min="0" label="未活动时间（分钟）" />
+                    <VTextField v-model.number="localTask.seed_inactivetime" type="number" min="0" clearable hint="留空继承全局，填写后覆盖" persistent-hint label="未活动时间（分钟）" />
                   </VCol>
                   <VCol cols="12" md="4">
-                    <VTextField v-model.number="localTask.seed_avgspeed" type="number" min="0" label="平均上传速度（KB/s）" />
+                    <VTextField v-model.number="localTask.seed_avgspeed" type="number" min="0" clearable hint="留空继承全局，填写后覆盖" persistent-hint label="平均上传速度（KB/s）" />
                   </VCol>
                   <VCol cols="12" md="8">
-                    <VTextField v-model="localTask.delete_except_tags" label="删除排除标签" />
+                    <VTextField v-model="localTask.delete_except_tags" clearable label="删除排除标签" hint="留空继承全局，填写后覆盖，多个标签用逗号分隔" persistent-hint />
                   </VCol>
                 </VRow>
-                <VSwitch
+                <VSelect
                   v-model="localTask.del_no_free"
+                  :items="[{ title: '继承全局', value: null }, { title: '启用', value: true }, { title: '关闭', value: false }]"
                   label="删除促销过期的未完成下载"
-                  color="primary"
-                  hide-details
-                  inset
+                  hint="选择启用或关闭覆盖全局，继承全局使用全局开关"
+                  persistent-hint
                 />
               </section>
             </VWindowItem>
@@ -385,15 +403,6 @@ async function saveTask() {
                   </VCol>
                   <VCol cols="12" md="6">
                     <VTextField v-model.number="localTask.auto_archive_days" type="number" min="0" label="自动归档天数" />
-                  </VCol>
-                  <VCol cols="12">
-                    <VTextField
-                      v-model="localTask.tag"
-                      label="下载器标签（可选）"
-                      placeholder="默认：刷流-站点名"
-                      hint="下载器中的种子标签，留空自动使用「刷流-站点名」；同一站点存在多个任务时请设置为不同标签"
-                      persistent-hint
-                    />
                   </VCol>
                 </VRow>
                 <div class="editor-switches">

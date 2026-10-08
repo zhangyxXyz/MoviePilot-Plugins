@@ -62,6 +62,7 @@ TASK_CONFIG_FIELDS = (
     "seeder",
     "timezone_offset",
     "pubtime",
+    "min_seed_hours",
     "seed_time",
     "hr_seed_time",
     "seed_ratio",
@@ -94,6 +95,7 @@ LEGACY_SITE_OVERRIDE_FIELDS = {
     "seeder",
     "timezone_offset",
     "pubtime",
+    "min_seed_hours",
     "seed_time",
     "hr_seed_time",
     "seed_ratio",
@@ -111,6 +113,14 @@ LEGACY_SITE_OVERRIDE_FIELDS = {
 }
 
 GLOBAL_LIMIT_FIELDS = (
+    "global_seed_ratio",
+    "global_seed_size",
+    "global_download_time",
+    "global_seed_avgspeed",
+    "global_hr_seed_time",
+
+    "global_min_seed_hours",
+    "global_inactive_hours",
     "global_disksize",
     "global_maxdlcount",
     "global_maxupspeed",
@@ -118,6 +128,8 @@ GLOBAL_LIMIT_FIELDS = (
 )
 
 GLOBAL_DYNAMIC_DELETE_FIELDS = (
+    "global_del_no_free",
+    "global_delete_except_tags",
     "global_proxy_delete",
     "global_delete_size_range",
 )
@@ -154,6 +166,7 @@ class BrushTaskConfig:
         self.seeder = self._clean_text(config.get("seeder"))
         self.timezone_offset = float(self._parse_number(config.get("timezone_offset")) or 0)
         self.pubtime = self._clean_text(config.get("pubtime"))
+        self.min_seed_hours = self._parse_number(config.get("min_seed_hours"))
         self.seed_time = self._parse_number(config.get("seed_time"))
         self.hr_seed_time = self._parse_number(config.get("hr_seed_time"))
         self.seed_ratio = self._parse_number(config.get("seed_ratio"))
@@ -169,7 +182,7 @@ class BrushTaskConfig:
         self.delete_except_tags = self._clean_text(config.get("delete_except_tags"))
         self.except_subscribe = bool(config.get("except_subscribe", True))
         self.proxy_delete = bool(config.get("proxy_delete", False))
-        self.del_no_free = bool(config.get("del_no_free", False)) if self.freeleech in {"free", "2xfree"} else False
+        self.del_no_free = config.get("del_no_free")
         self.qb_category = self._clean_text(config.get("qb_category"))
         self.site_hr_active = bool(config.get("site_hr_active", False))
         self.site_skip_tips = bool(config.get("site_skip_tips", False))
@@ -178,7 +191,7 @@ class BrushTaskConfig:
 
     @property
     def brush_tag(self) -> str:
-        """返回当前任务在下载器中使用的标签（默认按站点名称生成，保证可读性）"""
+        """保留自定义标签；默认按站点名称生成，站点不存在时回退到任务 ID。"""
         if self.tag:
             return self.tag
         site_name = BrushFlow._get_site_name(self.site_id) if self.site_id else None
@@ -218,9 +231,9 @@ class BrushFlow(_PluginBase):
     plugin_name = "站点刷流"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush-flow.png"
-    plugin_version = "6.1.2"
-    plugin_author = "jxxghp,InfinityPacer,Seed680"
-    author_url = "https://github.com/InfinityPacer"
+    plugin_version = "6.2.1"
+    plugin_author = "seiun,jxxghp,InfinityPacer,Seed680"
+    author_url = "https://github.com/zhangyxXyz/MoviePilot-Plugins"
     plugin_config_prefix = "brushflow_"
     plugin_order = 21
     auth_level = 2
@@ -254,6 +267,8 @@ class BrushFlow(_PluginBase):
             "global_proxy_delete",
             raw_config.get("proxy_delete", False) if legacy_config else False,
         )
+        self._global_del_no_free = bool(raw_config.get("global_del_no_free", False))
+        self._global_delete_except_tags = raw_config.get("global_delete_except_tags", "MOVIEPILOT,H&R")
         legacy_delete_range = raw_config.get("delete_size_range") if legacy_config else None
         self._global_proxy_delete, self._global_delete_size_range = self._validate_global_dynamic_delete_config(
             global_proxy_delete,
@@ -516,7 +531,8 @@ class BrushFlow(_PluginBase):
             setattr(self, f"_{field}", getattr(payload, field))
         for field in GLOBAL_DYNAMIC_DELETE_FIELDS:
             setattr(self, f"_{field}", getattr(payload, field))
-        if global_dynamic_delete_was_enabled and not self._global_dynamic_delete_enabled():
+        if (global_dynamic_delete_was_enabled and not self._global_dynamic_delete_enabled()
+                and not self._guarded_delete_enabled()):
             for task in self._task_configs.values():
                 if task.proxy_delete and not task.delete_size_range:
                     task.proxy_delete = False
@@ -651,6 +667,17 @@ class BrushFlow(_PluginBase):
             Scheduler().update_plugin_job(self.__class__.__name__)
         except Exception as err:
             logger.error(f"更新站点刷流调度失败：{str(err)}")
+
+    def _guarded_delete_enabled(self) -> bool:
+        """有保种策略时统一交由共享文件保护执行器删除，避免普通删种绕过保护。"""
+        return bool(getattr(self, "_global_min_seed_hours", None)
+                    or getattr(self, "_global_inactive_hours", None)
+                    or getattr(self, "_global_del_no_free", False)
+                    or any(getattr(self, f"_{field}", None) for field in ('global_seed_ratio', 'global_seed_size', 'global_download_time', 'global_seed_avgspeed', 'global_hr_seed_time'))
+                    or any(getattr(t, "min_seed_hours", None) for t in self._task_configs.values())
+                    or (self._global_dynamic_delete_enabled() and any(
+                        any(getattr(t, field, None) for field in ("min_seed_hours", "seed_time", "seed_ratio", "seed_size", "download_time", "seed_avgspeed", "hr_seed_time", "seed_inactivetime", "del_no_free"))
+                        for t in self._task_configs.values())))
 
     def _global_dynamic_delete_enabled(self) -> bool:
         """返回全局动态删种开关与阈值是否同时有效"""
@@ -1074,6 +1101,7 @@ class BrushFlow(_PluginBase):
         return {
             "enabled": self.get_state(),
             "show_sidebar_nav": self._show_sidebar_nav,
+            "guarded_delete_enabled": self._guarded_delete_enabled(),
             **{field: getattr(self, f"_{field}", None) for field in GLOBAL_LIMIT_FIELDS},
             **{field: getattr(self, f"_{field}", None) for field in GLOBAL_DYNAMIC_DELETE_FIELDS},
             "summary": aggregate,
@@ -1177,7 +1205,6 @@ class BrushFlow(_PluginBase):
         upload = BrushTaskConfig._parse_number(getattr(user_data, "upload", None)) or 0
         download = BrushTaskConfig._parse_number(getattr(user_data, "download", None)) or 0
         unlimited = float(ratio) == 0 and float(upload) > 0 and float(download) <= 0
-        # 站点响应不完整时解析器会保留三个字段的零值，不能把它当成真实低分享率。
         if float(ratio) == 0 and float(upload) <= 0 and float(download) <= 0:
             return status
         updated_day = getattr(user_data, "updated_day", None)
@@ -1676,7 +1703,8 @@ class BrushFlow(_PluginBase):
         self.__update_torrent_tasks_state(check_torrents, torrent_tasks)
         self.__update_undeleted_torrents_missing_in_downloader(torrent_tasks, check_hashes, seeding_torrents)
         filtered_torrents = self.__filter_torrents_by_tag(check_torrents, task.delete_except_tags)
-        if self._global_dynamic_delete_enabled():
+        if self._global_dynamic_delete_enabled() or self._guarded_delete_enabled():
+            # 保种策略启用后，普通删种不得绕过全局执行器的共享文件检查。
             need_delete_hashes = []
         elif task.proxy_delete and task.delete_size_range:
             need_delete_hashes = self.__delete_torrent_for_proxy(filtered_torrents, torrent_tasks)
@@ -2187,6 +2215,9 @@ class BrushFlow(_PluginBase):
 
         try:
             with self._all_task_locks_scope():
+                if self._guarded_delete_enabled():
+                    from .guarded_cleanup import execute
+                    return execute(self)
                 candidates, total_size, task_records, services = self._collect_global_dynamic_delete_candidates()
                 limits = [
                     float(value) * 1024 ** 3
@@ -2523,7 +2554,7 @@ class BrushFlow(_PluginBase):
                 download_dir=task.save_path,
                 cookie=cookies,
                 category=task.qb_category,
-                tag=[task.brush_tag, random_tag],
+                tag=["已整理", self.GLOBAL_BRUSH_TAG, task.brush_tag, random_tag],
                 upload_limit=up_limit,
                 download_limit=down_limit,
             ):
@@ -2543,7 +2574,7 @@ class BrushFlow(_PluginBase):
                 content=torrent_content,
                 download_dir=task.save_path,
                 cookie=cookies,
-                labels=[task.brush_tag],
+                labels=["已整理", self.GLOBAL_BRUSH_TAG, task.brush_tag],
             )
             if not added_torrent:
                 return None
@@ -2693,7 +2724,7 @@ class BrushFlow(_PluginBase):
             return 0
 
     def __get_global_downloading_count(self) -> int:
-        """按下载器去重汇总带全局刷流标签或任务标签的下载中种子数量。"""
+        """兼容旧站点标签与定制版全局标签，按下载器去重统计下载数量。"""
         total_count = 0
         downloader_names = {task.downloader for task in self._task_configs.values() if task.downloader}
         downloader_helper = DownloaderHelper()

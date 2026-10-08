@@ -1,8 +1,8 @@
 """站点刷流 V3 插件：种子下载标签逻辑单测。
 
-覆盖 issue #6322 修复：
+覆盖定制版标签与现有配置的兼容性：
 - 任务默认按站点名称生成可读标签（如「刷流-聆音」），不再使用随机代码；
-- 新增种子仅打该单一标签（qBittorrent / Transmission）；
+- 新增种子保留“已整理”“刷流”及任务标签（qBittorrent / Transmission）；
 - 全局下载数量统计兼容新站点标签与旧全局标签。
 """
 import threading
@@ -64,7 +64,7 @@ class TestBrushTag:
 
 
 class TestDownloadTags:
-    """__download 添加种子时仅打单一可读标签"""
+    """__download 保留定制版保护所需标签及可读任务标签"""
 
     def _mock_qb_environment(self, plugin, downloader):
         mock_service = MagicMock()
@@ -78,7 +78,7 @@ class TestDownloadTags:
         patch_request = patch("app.plugins.brushflow.RequestUtils", return_value=MagicMock(ok=False))
         return patch_service, patch_helper, patch_request
 
-    def test_qb_download_applies_only_readable_tag(self):
+    def test_qb_download_applies_guard_and_readable_tags(self):
         task = _make_task()
         plugin = _make_plugin(task)
         torrent = MagicMock()
@@ -99,15 +99,13 @@ class TestDownloadTags:
 
         assert result == "hash123"
         _, kwargs = downloader.add_torrent.call_args
-        assert kwargs["tag"][0] == "刷流-聆音"
-        assert "已整理" not in kwargs["tag"]
-        assert "刷流" not in kwargs["tag"]
-        # 仅站点可读标签 + 用于定位种子 Hash 的临时唯一标签
-        assert len(kwargs["tag"]) == 2
+        assert kwargs["tag"][:3] == ["已整理", "刷流", "刷流-聆音"]
+        # 保留用于定位种子 Hash 的临时唯一标签。
+        assert len(kwargs["tag"]) == 4
         lookup_tag = downloader.get_torrent_id_by_tag.call_args.kwargs["tags"]
         assert lookup_tag in kwargs["tag"]
 
-    def test_transmission_download_applies_only_readable_label(self):
+    def test_transmission_download_applies_guard_and_readable_labels(self):
         task = _make_task()
         plugin = _make_plugin(task)
         torrent = MagicMock()
@@ -134,7 +132,7 @@ class TestDownloadTags:
 
         assert result == "hashxyz"
         _, kwargs = downloader.add_torrent.call_args
-        assert kwargs["labels"] == ["刷流-聆音"]
+        assert kwargs["labels"] == ["已整理", "刷流", "刷流-聆音"]
 
 
 class TestGlobalDownloadingCount:
