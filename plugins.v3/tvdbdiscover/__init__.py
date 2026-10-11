@@ -1,3 +1,7 @@
+import asyncio
+from threading import RLock
+from concurrent.futures import ThreadPoolExecutor
+
 from typing import Any, List, Dict, Tuple, Optional
 
 from cachetools import cached, TTLCache
@@ -8,8 +12,10 @@ from app.sdk.events import eventmanager, Event
 from app.sdk.logging import logger
 from app.plugins import _PluginBase
 from app.schemas import DiscoverSourceEventData
-from app.schemas.types import ChainEventType, MediaSource
+from app.schemas.types import ChainEventType, MediaSource, MediaType
 from app.sdk.network import RequestUtils
+
+from .details import image_url, to_media, language_code, episode_rows, to_season, to_episode
 
 
 class TvdbDiscover(_PluginBase):
@@ -20,11 +26,11 @@ class TvdbDiscover(_PluginBase):
     # 插件图标
     plugin_icon = "TheTVDB_A.png"
     # 插件版本
-    plugin_version = "2.1.1"
+    plugin_version = "2.3.0"
     # 插件作者
-    plugin_author = "jxxghp"
+    plugin_author = "seiun, jxxghp"
     # 作者主页
-    author_url = "https://github.com/jxxghp"
+    author_url = "https://github.com/zhangyxXyz/MoviePilot-Plugins"
     # 插件配置项ID前缀
     plugin_config_prefix = "tvdbdiscover_"
     # 加载顺序
@@ -39,6 +45,11 @@ class TvdbDiscover(_PluginBase):
     _api_key = None
 
     def init_plugin(self, config: dict = None):
+        self.__get_token.cache_clear()
+        self._api_get.cache_clear()
+        self._enabled = False
+        self._proxy = False
+        self._api_key = None
         if config:
             self._enabled = config.get("enabled")
             self._proxy = config.get("proxy")
@@ -68,6 +79,13 @@ class TvdbDiscover(_PluginBase):
             "summary": "TheTVDB探索数据源",
             "description": "获取TheTVDB探索数据",
             "response_model": schemas.Response[List[schemas.MediaInfo]],
+        }, {
+            "path": "/tvdb_season/{series_id}/{season_number}",
+            "endpoint": self.tvdb_season,
+            "methods": ["GET"],
+            "auth": "bear",
+            "summary": "TheTVDB原生季和单集剧情",
+            "response_model": schemas.Response[schemas.MediaSeason],
         }]
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
@@ -146,49 +164,163 @@ class TvdbDiscover(_PluginBase):
     def get_page(self) -> List[dict]:
         pass
 
-    @cached(cache=TTLCache(maxsize=1, ttl=30 * 24 * 3600))
-    def __get_token(self) -> Optional[str]:
-        """
-        根据APIKEY获取token使用
-        """
-        api_url = f"{self._base_api}/login"
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json"
-        }
-        data = {
-            "apikey": self._api_key
-        }
-        res = RequestUtils(headers=headers).post_res(
-            api_url,
-            json=data,
-            proxies=settings.PROXY if self._proxy else None
+    @cached(cache=TTLCache(maxsize=1, ttl=24 * 3600), lock=RLock())
+    def __get_token(self) -> str:
+        res = RequestUtils(headers={"Accept": "application/json", "Content-Type": "application/json"}).post_res(
+            f"{self._base_api}/login", json={"apikey": self._api_key},
+            proxies=settings.PROXY if self._proxy else None,
         )
-        if not res:
-            logger.error("获取TheMovieDB token失败")
-            return None
-        return res.json().get("data", {}).get("token")
+        if res is None or not res.ok:
+            raise RuntimeError("TheTVDB 登录失败，请检查插件 API Key 和代理设置")
+        token = (res.json().get("data") or {}).get("token")
+        if not token:
+            raise RuntimeError("TheTVDB 登录响应缺少 token")
+        return token
 
-    @cached(cache=TTLCache(maxsize=32, ttl=1800))
+    @cached(cache=TTLCache(maxsize=128, ttl=1800), lock=RLock())
+    def _api_get(self, path: str, **params):
+        for attempt in range(2):
+            res = RequestUtils(headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {self.__get_token()}",
+            }).get_res(
+                f"{self._base_api}/{path}", params=params,
+                proxies=settings.PROXY if self._proxy else None,
+            )
+            if res is None:
+                raise ConnectionError("无法连接 TheTVDB，请检查插件代理和网络")
+            if res.status_code == 401 and attempt == 0:
+                self.__get_token.cache_clear()
+                continue
+            if not res.ok:
+                raise RuntimeError(f"TheTVDB {path} 请求失败（HTTP {res.status_code}）")
+            payload = res.json()
+            if payload.get("status") != "success" or payload.get("data") is None:
+                raise RuntimeError(f"TheTVDB {path} 未返回有效数据")
+            return payload["data"]
+
     def __request(self, mtype: str, **kwargs):
-        """
-        请求TheTVDB API
-        """
-        api_url = f"{self._base_api}/{mtype}/filter"
-        headers = {
-            "Accept": "application/json",
-            "Authorization": f"Bearer {self.__get_token()}"
+        return self._api_get(f"{mtype}/filter", **kwargs)
+
+    def get_module(self) -> Dict[str, Any]:
+        if not self._enabled or not self._api_key:
+            return {}
+        return {
+            "recognize_media": self.recognize_media,
+            "async_recognize_media": self.async_recognize_media,
         }
-        res = RequestUtils(headers=headers).get_res(
-            api_url,
-            params=kwargs,
-            proxies=settings.PROXY if self._proxy else None
-        )
-        if res is None:
-            raise Exception("无法连接TheTVDB，请检查网络连接！")
-        if not res.ok:
-            raise Exception(f"请求TheTVDB API失败：{res.text}")
-        return res.json().get("data")
+
+    def recognize_media(self, meta=None, mtype=None, media_source=None,
+                        media_id=None, **kwargs):
+        """仅处理显式 TVDB 原生身份，不干预 TMDB 等其它识别源。"""
+        if not self._enabled or media_source != MediaSource.TVDB:
+            return None
+        identity = str(media_id or "").strip()
+        if not identity.isdigit() or int(identity) <= 0:
+            return None
+        mtype = mtype or getattr(meta, "type", None)
+        if mtype not in (MediaType.TV, MediaType.MOVIE):
+            return None
+        resource = "series" if mtype == MediaType.TV else "movies"
+        try:
+            info = self._api_get(f"{resource}/{identity}/extended", meta="translations")
+            if not isinstance(info, dict) or str(info.get("id")) != identity or not info.get("name"):
+                raise ValueError("详情缺少名称或返回的 TVDB ID 不匹配")
+            media = to_media(info, mtype, getattr(settings, "TMDB_LOCALE", "zh"))
+            if mtype == MediaType.TV:
+                self._fill_seasons(media, info)
+            return media
+        except Exception as err:
+            logger.error(f"TheTVDB {resource}/{identity} 详情识别失败：{err}")
+            return None
+
+    async def async_recognize_media(self, *args, **kwargs):
+        # 阻塞 HTTP 调用离开主事件循环，避免浏览详情拖慢其他 API。
+        return await asyncio.to_thread(self.recognize_media, *args, **kwargs)
+
+    @staticmethod
+    def _native_seasons(info):
+        order = info.get("defaultSeasonType") or 1
+        seasons = {}
+        for season in info.get("seasons") or []:
+            number = season.get("number")
+            if ((season.get("type") or {}).get("id") == order
+                    and isinstance(number, int) and number >= 0 and season.get("id")):
+                seasons.setdefault(number, season)
+        return [seasons[number] for number in sorted(seasons)]
+
+    def _season_info(self, series_id, season):
+        info = self._api_get(f"seasons/{season['id']}/extended", meta="translations")
+        if (str(info.get("seriesId")) != str(series_id)
+                or info.get("number") != season.get("number")
+                or str(info.get("id")) != str(season["id"])):
+            raise ValueError("TVDB 季身份不匹配")
+        return info
+
+    def _fill_seasons(self, media, info):
+        """补齐默认编排的季摘要及真实集号，单集剧情在展开时另行加载。"""
+        seasons = self._native_seasons(info)
+        if not seasons:
+            return
+        def load(season):
+            try:
+                return self._season_info(media.media_id, season)
+            except Exception as err:
+                logger.warning(f"TheTVDB {media.media_id} 第 {season['number']} 季摘要加载失败：{err}")
+                return None
+        # 限制并发；不会为同一剧集同时发送数十个 TVDB 请求。
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            details = list(executor.map(load, seasons))
+        summaries = {item["season_number"]: item for item in media.season_info}
+        for detail in details:
+            if detail is None:
+                continue
+            number = detail["number"]
+            summaries[number] = to_season(detail, getattr(settings, "TMDB_LOCALE", "zh"))
+            media.seasons[number] = [episode["number"] for episode in episode_rows(detail)]
+            year = (summaries[number].get("air_date") or "")[:4]
+            if year:
+                media.season_years[number] = year
+        media.season_info = [summaries[number] for number in sorted(summaries)]
+        if all(detail is not None for detail in details):
+            media.number_of_episodes = sum(len(episodes) for number, episodes in media.seasons.items() if number > 0)
+
+    def _episode_with_translation(self, episode, language):
+        translated = None
+        available = set(episode.get("nameTranslations") or []) | set(episode.get("overviewTranslations") or [])
+        if language != "eng" and language in available and episode.get("id"):
+            try:
+                translated = self._api_get(f"episodes/{episode['id']}/translations/{language}")
+            except Exception as err:
+                logger.warning(f"TheTVDB 单集 {episode['id']} 翻译不可用，保留原文：{err}")
+        return to_episode(episode, translated)
+
+    def _load_season(self, series_id: int, season_number: int):
+        if not self._enabled or series_id <= 0 or season_number < 0:
+            raise ValueError("无效的剧集或季号，或插件未启用")
+        series = self._api_get(f"series/{series_id}/extended", meta="translations")
+        if str(series.get("id")) != str(series_id):
+            raise ValueError("TVDB 剧集身份不匹配")
+        season = next((item for item in self._native_seasons(series) if item["number"] == season_number), None)
+        if season is None:
+            raise ValueError("TVDB 默认编排中未找到该季")
+        detail = self._season_info(series_id, season)
+        language = language_code(getattr(settings, "TMDB_LOCALE", "zh"))
+        result = to_season(detail, language)
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            result["episodes"] = list(executor.map(
+                lambda episode: self._episode_with_translation(episode, language), episode_rows(detail)
+            ))
+        return schemas.MediaSeason.model_validate(result)
+
+    async def tvdb_season(self, series_id: int, season_number: int) -> schemas.Response[schemas.MediaSeason]:
+        """按需读取 TVDB 默认编排中的一季，提供逐集标题、剧情和原生图片地址。"""
+        try:
+            season = await asyncio.to_thread(self._load_season, series_id, season_number)
+            return schemas.Response(success=True, data=season)
+        except Exception as err:
+            logger.error(f"TheTVDB {series_id} 第 {season_number} 季加载失败：{err}")
+            return schemas.Response(success=False, message=str(err))
 
     def tvdb_discover(self, apikey: str, mtype: str = "series",
                       company: int = None, contentRating: int = None, country: str = "usa",
@@ -229,8 +361,8 @@ class TvdbDiscover(_PluginBase):
                 title_year=f"{movie_info.get('name')} ({movie_info.get('year')})",
                 media_source=MediaSource.TVDB,
                 media_id=str(movie_info.get("id")),
-                poster_path=f"https://www.thetvdb.com{movie_info.get('image')}",
-                vote_average=movie_info.get("score"),
+                poster_path=image_url(movie_info.get("image")),
+                popularity=movie_info.get("score"),
                 runtime=movie_info.get("runtime"),
                 overview=movie_info.get("overview")
             )
@@ -275,20 +407,19 @@ class TvdbDiscover(_PluginBase):
                 media_source=MediaSource.TVDB,
                 media_id=str(series_info.get("id")),
                 release_date=series_info.get("firstAired"),
-                poster_path=series_info.get("image"),
-                vote_average=series_info.get("score"),
+                poster_path=image_url(series_info.get("image")),
+                popularity=series_info.get("score"),
                 runtime=series_info.get("averageRuntime"),
                 overview=series_info.get("overview")
             )
 
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=True, data=[])
+        if mtype not in {"series", "movies"} or page < 1 or not 1 <= count <= 500:
+            return schemas.Response(success=False, message="无效的类型或分页参数", data=[])
+        start = (page - 1) * count
+        req_page, offset = divmod(start, 500)
         try:
-            # 计算页码，TVDB为固定每页500条
-            if page * count > 500:
-                req_page = 500 // count
-            else:
-                req_page = page - 1
             result = self.__request(
                 mtype,
                 company=company,
@@ -301,10 +432,16 @@ class TvdbDiscover(_PluginBase):
                 status=status,
                 year=year,
                 page=req_page
-            )
+            ) or []
+            if offset + count > 500 and len(result) == 500:
+                result = result + (self.__request(
+                    mtype, company=company, contentRating=contentRating, country=country,
+                    genre=genre, lang=lang, sort=sort, sortType=sortType,
+                    status=status, year=year, page=req_page + 1,
+                ) or [])
         except Exception as err:
             logger.error(str(err))
-            return schemas.Response(success=True, data=[])
+            return schemas.Response(success=False, message=str(err), data=[])
         if not result:
             return schemas.Response(success=True, data=[])
         if mtype == "movies":
@@ -313,7 +450,7 @@ class TvdbDiscover(_PluginBase):
             results = [__series_to_media(series) for series in result]
         return schemas.Response(
             success=True,
-            data=results[(page - 1) * count:page * count],
+            data=results[offset:offset + count],
         )
 
     @staticmethod
@@ -612,7 +749,7 @@ class TvdbDiscover(_PluginBase):
     @eventmanager.register(ChainEventType.DiscoverSource)
     def discover_source(self, event: Event):
         """
-        监听识别事件，使用ChatGPT辅助识别名称
+        注册 TheTVDB 探索数据源
         """
         if not self._enabled or not self._api_key:
             return

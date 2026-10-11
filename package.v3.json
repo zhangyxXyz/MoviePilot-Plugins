@@ -580,20 +580,24 @@
   },
   "TvdbDiscover": {
     "name": "TheTVDB探索",
-    "description": "让探索支持TheTVDB的数据浏览。",
-    "labels": "探索",
-    "version": "2.1.1",
+    "description": "浏览 TVDB 原生电影、电视剧及季集剧情。",
+    "version": "2.3.0",
     "icon": "TheTVDB_A.png",
-    "author": "jxxghp",
+    "author": "seiun, jxxghp",
+    "author_url": "https://github.com/zhangyxXyz/MoviePilot-Plugins",
     "level": 1,
-    "release": true,
+    "labels": "探索",
+    "v3": true,
+    "system_version": ">=3.1.2",
     "history": {
+      "v2.3.0": "补齐 TVDB 默认季集编排、集数和季简介；按需加载单集翻译、剧情和剧照，配套原生详情页展示兼容补丁。",
+      "v2.2.0": "补齐 V3 原生 TVDB 详情识别，支持同步与异步入口；修复分页、图片地址与过期令牌重试。",
       "v2.1.1": "插件探索 API 显式返回统一响应，避免依赖宿主隐式包装。",
       "v2.1.0": "适配 V3 SDK 导入规范：插件内部导入全面迁移至 app.sdk 体系，去除对旧版兼容层的依赖。",
       "v2.0.0": "V3 独立大版本：TVDB 探索源改用固定来源枚举和媒体 ID。",
       "v1.1": "需要MoviePilot v2.2.7-1+ 版本，否则无法显示图片"
     },
-    "system_version": ">=3.0.0"
+    "release": true
   },
   "LunaTVSource": {
     "name": "LunaTV 资源订阅",
