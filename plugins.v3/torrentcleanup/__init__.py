@@ -16,12 +16,14 @@ from app.sdk.scheduler import add_plugin_once_job, remove_plugin_once_job, updat
 
 from .engine import Engine
 from .notifications import execution_notification
-from .configuration import reconcile_config
+from .configuration import reconcile_config, save_task_in_place, reorder_tasks
 from .gateway import Gateway
-from .models import BindPayload, CleanupTask, RunPayload, SettingsPayload
+from .models import BindPayload, CleanupTask, RunPayload, SettingsPayload, TaskOrderPayload
 from .verification import detail_url, parse_detail
 
 _OPERATION_LOCK = threading.Lock()
+_GLOBAL_FIELDS = ('enabled', 'show_sidebar', 'show_preview', 'sites', 'hr_enabled',
+                  'hr_downloaders', 'hr_check_minutes', 'hr_auto_release')
 
 
 class TorrentCleanup(_PluginBase):
@@ -30,7 +32,7 @@ class TorrentCleanup(_PluginBase):
     plugin_name = "种子清理"
     plugin_desc = "按下载器和站点管理多套清理策略，支持预览、保种保护与失效复核。"
     plugin_icon = "delete.jpg"
-    plugin_version = "0.5.5"
+    plugin_version = "0.6.5"
     plugin_author = "seiun"
     author_url = "https://github.com/zhangyxXyz/MoviePilot-Plugins"
     plugin_label = "下载管理,做种"
@@ -50,8 +52,8 @@ class TorrentCleanup(_PluginBase):
         """验证配置后加载任务，不在初始化时触发清理。"""
         self.stop_service()
         self._stop = threading.Event()
-        config = config or {}
-        global_config = SettingsPayload.model_validate({k: config[k] for k in ("enabled", "show_sidebar", "show_preview", "sites") if k in config})
+        config = {**(config or {}), "hr_enabled": False}
+        global_config = SettingsPayload.model_validate({k: config[k] for k in _GLOBAL_FIELDS if k in config})
         tasks = [CleanupTask.model_validate(t).model_dump() for t in config.get("tasks", [])]
         self._config = {**global_config.model_dump(), "tasks": tasks,
                         "revision": config.get("revision") or uuid.uuid4().hex}
@@ -88,6 +90,7 @@ class TorrentCleanup(_PluginBase):
     def get_api(self):
         """所有前端接口需要宿主认证及管理权限。"""
         routes = [("/status", self.status, "GET"), ("/settings", self.settings_update, "POST"),
+                  ("/tasks/order", self.task_order, "POST"),
                   ("/tasks", self.task_save, "POST"), ("/tasks/{task_id}", self.task_delete, "DELETE"),
                   ("/tasks/{task_id}/preview", self.preview, "POST"),
                   ("/tasks/{task_id}/execute", self.execute, "POST"),
@@ -98,12 +101,11 @@ class TorrentCleanup(_PluginBase):
 
     def get_service(self):
         """为每个启用任务登记独立的宿主 Cron 调度。"""
-        if not self._config.get('enabled', False):
-            return []
-        return [{"id": f"TorrentCleanup_{t['id']}", "name": f"清理：{t['name']}",
+        jobs = [{"id": f"TorrentCleanup_{t['id']}", "name": f"清理：{t['name']}",
                  "trigger": CronTrigger.from_crontab(t["cron"], timezone=settings.TZ),
                  "func": self.run, "func_kwargs": {"task_id": t["id"], "scheduled": True}}
-                for t in self._config.get("tasks", []) if t["enabled"]]
+                for t in self._config.get("tasks", []) if t["enabled"] and self._config.get('enabled')]
+        return jobs
 
     def stop_service(self):
         """停止已排队的一次性任务并要求执行器在下一个边界退出。"""
@@ -114,7 +116,12 @@ class TorrentCleanup(_PluginBase):
 
     def _settings(self):
         """读取当前全局模型，避免复用可变配置对象。"""
-        return SettingsPayload.model_validate({k: self._config[k] for k in ("enabled", "show_sidebar", "show_preview", "sites") if k in self._config})
+        return SettingsPayload.model_validate({k: self._config[k] for k in _GLOBAL_FIELDS if k in self._config})
+
+    def _gateway(self):
+        """为清理与标签托管使用一致的当前保护配置。"""
+        config = self._settings()
+        return Gateway(config.sites, hr_auto_release=config.hr_auto_release)
 
     def _task(self, task_id):
         """按稳定 ID 获取任务，不存在时返回明确的接口错误。"""
@@ -138,7 +145,7 @@ class TorrentCleanup(_PluginBase):
         """返回任务列表、最近预览及执行历史，不返回站点认证信息。"""
         error = ""
         try:
-            options = Gateway(self._settings().sites).options()
+            options = self._gateway().options()
         except Exception as err:
             options = {"sites": [], "downloaders": []}
             error = f"站点或下载器选项读取失败（{type(err).__name__}）"
@@ -167,7 +174,7 @@ class TorrentCleanup(_PluginBase):
         if not _OPERATION_LOCK.acquire(blocking=False):
             raise HTTPException(409, "任务正在检查或执行，请稍后保存")
         try:
-            gateway = Gateway(self._settings().sites)
+            gateway = self._gateway()
             if payload.downloader not in gateway.helper.get_configs():
                 raise HTTPException(422, "所选下载器不存在或未启用")
             if payload.mode == 'download_error' and gateway.helper.get_configs()[payload.downloader].type != 'qbittorrent':
@@ -178,12 +185,26 @@ class TorrentCleanup(_PluginBase):
                 self._task(payload.id)
             else:
                 payload.id = uuid.uuid4().hex
-            tasks = [t for t in self._config["tasks"] if t["id"] != payload.id]
-            if len(tasks) >= 100:
-                raise HTTPException(422, "清理任务数量超过上限")
-            tasks.append(payload.model_dump())
+            try:
+                tasks = save_task_in_place(self._config['tasks'], payload.model_dump())
+            except ValueError as err:
+                raise HTTPException(422, str(err)) from err
             self._save_config({**self._config, "tasks": tasks})
             return {"success": True, "data": payload.model_dump()}
+        finally:
+            _OPERATION_LOCK.release()
+
+    def task_order(self, payload: TaskOrderPayload, _: object = Depends(get_current_active_manage_user)):
+        """持久化左侧任务顺序，保留预览和观察记录。"""
+        if not _OPERATION_LOCK.acquire(blocking=False):
+            raise HTTPException(409, '任务正在检查或执行，请稍后排序')
+        try:
+            try:
+                tasks = reorder_tasks(self._config['tasks'], payload.ids)
+            except ValueError as err:
+                raise HTTPException(409, str(err)) from err
+            self._save_config({**self._config, 'tasks': tasks})
+            return {'success': True}
         finally:
             _OPERATION_LOCK.release()
 
@@ -231,7 +252,7 @@ class TorrentCleanup(_PluginBase):
         if not _OPERATION_LOCK.acquire(blocking=False):
             raise HTTPException(409, "任务正在运行，请稍后核对")
         try:
-            engine = Engine(Gateway(self._settings().sites), self.get_data, self.save_data, self._stop.is_set)
+            engine = Engine(self._gateway(), self.get_data, self.save_data, self._stop.is_set)
             return {"success": True, "data": engine.reconcile(task_id)}
         finally:
             _OPERATION_LOCK.release()
@@ -241,7 +262,7 @@ class TorrentCleanup(_PluginBase):
         if not _OPERATION_LOCK.acquire(blocking=False):
             raise HTTPException(409, "任务正在运行，请稍后关联详情页")
         try:
-            gateway = Gateway(self._settings().sites)
+            gateway = self._gateway()
             rows = gateway.snapshot(payload.downloader)
             row = next((r for r in rows if r.torrent.hash == payload.hash.lower()), None)
             if not row or payload.site_id not in row.torrent.site_ids:
@@ -286,7 +307,7 @@ class TorrentCleanup(_PluginBase):
                 return
             if (scheduled or plan_id) and (not self._config.get('enabled', False) or not task.enabled):
                 raise ValueError("插件或任务已停用")
-            engine = Engine(Gateway(self._settings().sites), self.get_data, self.save_data, lifecycle.is_set)
+            engine = Engine(self._gateway(), self.get_data, self.save_data, lifecycle.is_set)
             plans = self.get_data("plans") or {}
             if plan_id:
                 plan = plans.get(task_id)

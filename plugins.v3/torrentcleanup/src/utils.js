@@ -42,6 +42,7 @@ export function taskDraft(task = {}) {
     all_sites: false, categories: [], only_moviepilot: false, max_upload_speed_kib: null,
     error_states: ['error', 'missingFiles'], error_min_age_hours: 24, error_observation_hours: 6,
     error_min_observations: 3, error_gap_minutes: 15, error_max_progress: 99.9, error_protect_unknown_hr: true,
+    hr_local_conditions: false, hr_tags: [], hr_seed_hours: 168, hr_upload_gb: 0,
     states: [], error_keywords: [], completion: 'completed', require_healthy: true, filter_seed: true, filter_ratio: true,
     verify_invalid: false, observe_state: false, require_idle_download: false, filter_age: false, filter_progress: false,
     min_size_gb: 0, max_size_gb: null, path_prefix: '', include_tags: [],
@@ -51,8 +52,8 @@ export function taskDraft(task = {}) {
 
 export function normalizeTask(draft) {
   const result = taskDraft(draft)
-  for (const key of ['include_tags', 'protect_tags', 'categories', 'error_keywords']) result[key] = tags(result[key])
-  for (const key of ['min_seed_hours', 'min_ratio', 'min_size_gb', 'observation_hours', 'min_observations', 'observation_gap_hours', 'max_count', 'max_gb']) result[key] = Number(result[key])
+  for (const key of ['include_tags', 'protect_tags', 'hr_tags', 'categories', 'error_keywords']) result[key] = tags(result[key])
+  for (const key of ['hr_seed_hours', 'hr_upload_gb', 'min_seed_hours', 'min_ratio', 'min_size_gb', 'observation_hours', 'min_observations', 'observation_gap_hours', 'max_count', 'max_gb']) result[key] = Number(result[key])
   result.max_size_gb = result.max_size_gb === '' || result.max_size_gb == null ? null : Number(result.max_size_gb)
   result.max_upload_speed_kib = result.max_upload_speed_kib === '' || result.max_upload_speed_kib == null ? null : Number(result.max_upload_speed_kib)
   for (const key of ['error_min_age_hours', 'error_observation_hours', 'error_min_observations', 'error_gap_minutes', 'error_max_progress']) result[key] = Number(result[key])
@@ -64,4 +65,14 @@ export function canExecute(config, task, plan, busy, now = Date.now() / 1000) {
   return !!(config?.enabled && task?.enabled && !busy && plan?.candidate_count > 0 &&
     task.action !== 'preview' && plan.action === task.action && plan.revision === config.revision &&
     now >= plan.created_at && now - plan.created_at <= 900)
+}
+
+/** 拖动插入目标位置；筛选时仅重排可见任务，隐藏任务保持原位。 */
+export function orderedIds(tasks, from, to, visible = tasks) {
+  const ids = visible.map(t => t.id), a = ids.indexOf(from), b = ids.indexOf(to)
+  if (a < 0 || b < 0 || a === b) return tasks.map(t => t.id)
+  ids.splice(b, 0, ids.splice(a, 1)[0])
+  const selected = new Set(ids)
+  let index = 0
+  return tasks.map(t => selected.has(t.id) ? ids[index++] : t.id)
 }

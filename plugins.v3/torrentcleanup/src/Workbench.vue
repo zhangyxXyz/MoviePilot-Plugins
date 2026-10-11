@@ -1,7 +1,7 @@
 <script setup>
 import { computed, inject, onMounted, onUnmounted, ref, watch } from 'vue'
 import TaskEditor from './TaskEditor.vue'
-import { actionName, canExecute, dateTime, errorText, formatBytes, modeName, stateName, tags, unwrap } from './utils'
+import { orderedIds, actionName, canExecute, dateTime, errorText, formatBytes, modeName, stateName, tags, unwrap } from './utils'
 
 const props = defineProps({ api: { type: Object, default: () => ({}) }, pluginId: { type: String, default: 'TorrentCleanup' } })
 const emit = defineEmits(['action'])
@@ -12,6 +12,11 @@ const autoLoaded = new Set()
 const editor = ref(false), editorTask = ref({}), settingsOpen = ref(false), settingsDraft = ref({ sites: [] })
 const onlyEligible = ref(false), confirmOpen = ref(false), deleteOpen = ref(false), bindOpen = ref(false)
 const bindDraft = ref({}), now = ref(Date.now() / 1000), toast = inject('moviepilot:toast', null)
+const hrConfirm = ref(null)
+const dragged = ref('')
+async function resolveHR() {
+  try { await post('/hr/resolve', hrConfirm.value); hrConfirm.value = null; notify('确认已保存，已排队更新保护状态'); await refresh(true) } catch {}
+}
 let timer, lastLoad = 0
 const base = computed(() => `plugin/${props.pluginId}`)
 const tasks = computed(() => state.value.config.tasks || [])
@@ -61,6 +66,20 @@ async function post(path, payload = {}) {
   catch (e) { error.value = errorText(e); toast?.error?.(error.value); info.value = error.value; throw e } finally { saving.value = false }
 }
 function openEditor(value = {}) { editorTask.value = value; editor.value = true }
+async function sortTasks(from, to) {
+  if (saving.value || !from || from === to) return
+  const ids = orderedIds(tasks.value, from, to, visibleTasks.value)
+  try { await post('/tasks/order', { ids }); await refresh(true); notify('顺序已保存，预览和观察记录保持不变') } catch {}
+}
+function moveTask(id, direction) {
+  const neighbor = visibleTasks.value[visibleTasks.value.findIndex(t => t.id === id) + direction]
+  if (neighbor) return sortTasks(id, neighbor.id)
+}
+function startTaskDrag(event, id) {
+  dragged.value = id
+  event.dataTransfer?.setData('text/plain', id)
+  if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move'
+}
 async function saveTask(payload) {
   try { const result = await post('/tasks', payload); editor.value = false; selected.value = result.id; await refresh(); notify(plan.value ? '任务已保存，原预览与观察记录已保留' : '任务已保存，判断条件变化后需要重新预览') } catch {}
 }
@@ -88,21 +107,23 @@ async function openSettings() {
   if (state.value.error) { error.value = state.value.error; return }
   const existing = state.value.config.sites || []
   settingsDraft.value = { enabled: state.value.config.enabled, show_sidebar: state.value.config.show_sidebar !== false, show_preview: showPreview.value,
+    hr_enabled: state.value.config.hr_enabled || false, hr_downloaders: [...(state.value.config.hr_downloaders || [])],
+    hr_check_minutes: state.value.config.hr_check_minutes || 15, hr_auto_release: state.value.config.hr_auto_release || false,
     sites: state.value.options.sites.map(s => JSON.parse(JSON.stringify(existing.find(p => p.site_id === s.value) || {
       site_id: s.value, tracker_hosts: [], hr_mode: 'unknown', min_seed_hours: 168, verification: 'unsupported',
       auto_discover: true, search_url_template: '', detail_path: '/details.php', detail_id_param: 'id',
       check_interval_hours: 6, request_gap_seconds: 2, max_requests_per_hour: 20, max_detail_candidates: 5,
       detail_requests_per_hour: 100, search_requests_per_day: 1000, torrent_downloads_per_hour: 100, torrent_downloads_per_day: 1000, error_cache_minutes: 10,
       allow_torrent_verification: false, torrent_download_path: '/download.php?id={id}', torrent_download_hosts: [],
+      hr_detection: 'marked', hr_required_hours: 48, hr_buffer_hours: 24, hr_deadline_days: 14, hr_seed_ratio: 0, hr_ratio_basis: 'client',
     }))) }
   settingsOpen.value = true
 }
 async function saveSettings() {
   const payload = JSON.parse(JSON.stringify(settingsDraft.value))
+  payload.hr_check_minutes = Number(payload.hr_check_minutes)
   for (const site of payload.sites) {
-    site.tracker_hosts = tags(site.tracker_hosts)
-    site.torrent_download_hosts = tags(site.torrent_download_hosts)
-    for (const key of ['min_seed_hours', 'check_interval_hours', 'request_gap_seconds', 'max_requests_per_hour', 'max_detail_candidates', 'detail_requests_per_hour', 'search_requests_per_day', 'torrent_downloads_per_hour', 'torrent_downloads_per_day', 'error_cache_minutes']) site[key] = Number(site[key])
+    for (const key of ['min_seed_hours', 'check_interval_hours', 'request_gap_seconds', 'max_requests_per_hour', 'max_detail_candidates', 'detail_requests_per_hour', 'search_requests_per_day', 'torrent_downloads_per_hour', 'torrent_downloads_per_day', 'error_cache_minutes', 'hr_required_hours', 'hr_buffer_hours', 'hr_deadline_days', 'hr_seed_ratio']) site[key] = Number(site[key])
   }
   try { await post('/settings', payload); settingsOpen.value = false; await refresh(); notify('设置已保存，只有判断依据变化才会清空预览') } catch {}
 }
@@ -129,21 +150,24 @@ onUnmounted(() => clearInterval(timer))
 <template>
   <div class="cleanup-workbench">
     <header class="cleanup-header"><div class="d-flex align-center ga-3"><VAvatar color="primary" variant="tonal" rounded="lg" size="44"><VIcon icon="mdi-delete-outline" /></VAvatar><div><h2 class="text-h5 font-weight-bold">种子清理</h2><div class="text-body-2 text-medium-emphasis">按站点保留 · 有依据地清理</div></div></div>
-      <div class="d-flex align-center ga-2 flex-wrap"><VChip :color="state.config.enabled ? 'success' : 'default'" size="small" variant="tonal">{{ state.config.enabled ? '定时任务已启用' : '定时任务已关闭' }}</VChip>
-        <VBtn icon="mdi-refresh" variant="text" aria-label="刷新" :loading="loading" @click="refresh()" /><VBtn variant="outlined" prepend-icon="mdi-cog-outline" @click="openSettings">站点与保护</VBtn><VBtn color="primary" prepend-icon="mdi-plus" @click="openEditor()">新建任务</VBtn></div>
+      <div class="d-flex align-center ga-2 flex-wrap">
+        <VBtn icon="mdi-refresh" variant="text" aria-label="刷新" :loading="loading" @click="refresh()" /><VBtn variant="outlined" prepend-icon="mdi-cog-outline" @click="openSettings">站点与保护</VBtn></div>
     </header>
     <VAlert v-if="error || state.error" type="error" variant="tonal" class="mb-4" closable @click:close="error = ''; state.error = ''">{{ error || state.error }}</VAlert>
-    <VAlert v-if="!state.config.enabled" type="info" variant="tonal" class="mb-4" density="compact">当前可以预览和核验。启用“站点与保护”中的总开关后，已启用任务才会按计划运行。</VAlert>
+    <VAlert v-if="!state.config.enabled" type="info" variant="tonal" class="mb-4" density="compact">当前仅可预览和核验，启用“站点与保护”的总开关后，已启用任务才按计划执行。</VAlert>
     <div class="cleanup-layout">
-      <aside class="cleanup-task-list"><div class="list-caption">清理任务 <VChip size="x-small" variant="tonal">{{ tasks.length }}</VChip></div>
+      <aside class="cleanup-task-list">
         <VSelect v-model="downloaderFilter" :items="[{ title: '全部下载器', value: '' }, ...state.options.downloaders]" label="按下载器查看" density="compact" hide-details class="mb-3" />
-        <button v-for="entry in visibleTasks" :key="entry.id" class="task-button" :class="{ selected: selected === entry.id }" @click="selected = entry.id; onlyEligible = false">
-          <div class="d-flex align-center justify-space-between ga-2"><strong>{{ entry.name }}</strong><span class="status-dot" :class="{ on: entry.enabled && state.config.enabled }" /></div>
-          <div class="task-subtitle">{{ entry.downloader }} · {{ entry.all_sites ? '不限站点' : entry.site_ids.map(siteName).join('、') }}</div>
-          <div class="d-flex ga-2 mt-3"><VChip size="x-small" :color="entry.action.startsWith('delete') ? 'warning' : 'primary'" variant="tonal">{{ actionName(entry.action) }}</VChip></div>
+        <div v-for="(entry, index) in visibleTasks" :key="entry.id" class="task-row" :class="{ selected: selected === entry.id }" :draggable="!saving" @dragstart="startTaskDrag($event, entry.id)" @dragend="dragged = ''" @dragover.prevent @drop.prevent="sortTasks(dragged, entry.id); dragged = ''">
+        <button class="task-button" :class="{ selected: selected === entry.id }" @click="selected = entry.id; onlyEligible = false">
+          <div class="d-flex align-center justify-space-between ga-2"><VIcon icon="mdi-drag-vertical" size="18" class="task-drag-handle" /><strong class="flex-grow-1" :title="entry.name">{{ entry.name }}</strong><VChip size="x-small" :color="entry.enabled ? 'success' : 'default'">{{ entry.enabled ? '启用' : '停用' }}</VChip></div>
+          <div class="rail-tags"><span class="rail-pill rail-accent" :title="entry.downloader">{{ entry.downloader }}</span><span class="rail-pill" :class="entry.action.startsWith('delete')?'rail-warn':'rail-neutral'">{{ actionName(entry.action) }}</span></div>
+          <div class="rail-details"><div class="rail-row"><span class="rail-pill rail-label">生效站点</span><span class="rail-pill" :title="entry.all_sites ? '全部站点' : entry.site_ids.map(siteName).join('、') || '未选择'">{{ entry.all_sites ? '全部站点' : entry.site_ids.map(siteName).join('、') || '未选择' }}</span></div><div class="rail-row"><span class="rail-pill rail-label">执行周期</span><span class="rail-pill" :title="entry.cron">{{ entry.cron }}</span></div></div>
         </button>
+        <div class="task-order"><VBtn icon="mdi-arrow-up" size="x-small" variant="text" :aria-label="`上移 ${entry.name}`" :title="`上移 ${entry.name}`" :disabled="saving || index === 0" @click="moveTask(entry.id, -1)" /><VBtn icon="mdi-arrow-down" size="x-small" variant="text" :aria-label="`下移 ${entry.name}`" :title="`下移 ${entry.name}`" :disabled="saving || index === visibleTasks.length - 1" @click="moveTask(entry.id, 1)" /><VBtn icon="mdi-pencil" size="x-small" variant="text" aria-label="编辑任务" @click.stop="openEditor(entry)" /></div>
+        </div>
         <div v-if="!tasks.length" class="pa-5 text-body-2 text-medium-emphasis">先添加一个任务，选择下载器和需要管理的站点。</div>
-        <VBtn block variant="text" color="primary" prepend-icon="mdi-plus" class="mt-2" @click="openEditor()">添加清理策略</VBtn>
+        <VBtn block variant="tonal" color="primary" prepend-icon="mdi-plus" class="mt-3" @click="openEditor()">新建任务</VBtn>
       </aside>
       <main class="cleanup-detail">
         <template v-if="task">
@@ -152,7 +176,7 @@ onUnmounted(() => clearInterval(timer))
           </div>
           <div v-if="showPreview" class="summary-grid"><div><span>候选任务</span><strong>{{ plan?.candidate_count ?? '—' }} <small>个</small></strong></div><div><span>候选体积</span><strong>{{ plan ? formatBytes(plan.candidate_bytes) : '—' }}</strong></div><div><span>最低累计做种</span><strong>{{ task.mode === 'conditions' && !task.filter_seed ? '不限' : task.min_seed_hours }} <small v-if="task.mode !== 'conditions' || task.filter_seed">小时</small></strong></div><div><span>满足条件后</span><strong class="action-summary">{{ actionName(task.action) }}</strong></div></div>
           <div class="policy-summary"><VIcon icon="mdi-shield-check-outline" size="18" color="primary" /><span>分享率 {{ task.mode === 'conditions' && !task.filter_ratio ? '不限' : '≥ ' + task.min_ratio }} · 每轮 ≤ {{ task.max_count }} 个 / {{ task.max_gb }} GiB · {{ task.protect_tags.join('、') }} 受保护</span></div>
-          <div class="tab-toolbar"><VTabs v-model="tab" color="primary"><VTab v-if="showPreview" value="preview">候选预览</VTab><VTab value="history">执行记录 <VChip class="ml-2" size="x-small">{{ runs.length }}</VChip></VTab></VTabs><div v-if="showPreview" class="d-flex ga-2 flex-wrap"><VBtn variant="tonal" color="primary" prepend-icon="mdi-magnify" :loading="busy" :disabled="saving" @click="preview">刷新并检查</VBtn><VBtn v-if="task.action !== 'preview'" :disabled="!executable" color="primary" @click="confirmOpen = true">执行本次计划</VBtn></div></div>
+          <section class="cleanup-content-card"><div class="tab-toolbar"><VTabs v-model="tab" color="primary"><VTab v-if="showPreview" value="preview">候选预览</VTab><VTab value="history">执行记录 <VChip class="ml-2" size="x-small">{{ runs.length }}</VChip></VTab></VTabs><div v-if="showPreview" class="d-flex ga-2 flex-wrap"><VBtn variant="tonal" color="primary" prepend-icon="mdi-magnify" :loading="busy" :disabled="saving" @click="preview">刷新并检查</VBtn><VBtn v-if="task.action !== 'preview'" :disabled="!executable" color="primary" @click="confirmOpen = true">执行本次计划</VBtn></div></div>
           <div v-if="busy || runtime.started_at" class="scan-progress" aria-live="polite">
             <div class="d-flex justify-space-between ga-3 flex-wrap"><strong>{{ runtime.message }}</strong><span v-if="runtime.started_at">耗时 {{ Math.floor(elapsed / 60) }} 分 {{ elapsed % 60 }} 秒</span></div>
             <VProgressLinear v-if="busy" class="my-3" :indeterminate="runtime.total == null" :model-value="progressPercent" color="primary" rounded height="8" />
@@ -170,10 +194,10 @@ onUnmounted(() => clearInterval(timer))
               <template #item.reasons="{ item }"><VChip :color="item.eligible ? 'success' : 'default'" size="x-small" variant="tonal">{{ item.eligible ? '可处理' : '保留' }}</VChip><div class="reason-list">{{ item.reasons.join('，').replaceAll('；', '，') }}</div></template>
               <template #item.verification="{ item }"><div v-if="!item.evidence?.length" class="text-caption text-medium-emphasis">{{ task.mode === 'download_error' ? '下载错误策略，仅检查下载器状态，无需站点详情核验。' : task.mode === 'retention' ? '按做种时长等条件筛选，无需站点详情核验。' : !task.verify_invalid ? '未勾选站点失效复核，本任务按下载器条件筛选。' : '尚无站点核验证据，请检查站点映射。' }}</div><div v-for="e in item.evidence" :key="e.site_id" class="text-caption mb-1">{{ e.reason.replaceAll('；', '，') }}<div v-if="e.detail_url"><a :href="e.detail_url" target="_blank" rel="noopener noreferrer">查看详情页</a> · {{ e.source }} · {{ dateTime(e.checked_at) }}</div></div><VBtn v-if="item.site_ids.length" variant="text" size="small" color="primary" prepend-icon="mdi-link-variant" @click="openBinding(item)">自动查找 / 核验</VBtn></template>
             </VDataTable>
-            <div v-else class="empty-state"><VIcon icon="mdi-text-box-search-outline" size="48" color="primary" /><h4>{{ busy ? '正在读取下载器任务' : '暂未取得下载器结果' }}</h4><p>进入页面会自动读取。仅明确疑似失效的种子进一步请求站点，下载错误按下载器状态判断。</p><VBtn variant="tonal" color="primary" :loading="busy" @click="preview">重新读取</VBtn></div>
+            <div v-else class="empty-state"><VIcon icon="mdi-text-box-search-outline" size="48" color="primary" /><h4>{{ busy ? '正在读取下载器任务' : '暂未取得下载器结果' }}</h4><p>进入页面自动读取下载器，仅疑似失效的种子请求站点核验，下载错误按下载器状态判断。</p><VBtn variant="tonal" color="primary" :loading="busy" @click="preview">重新读取</VBtn></div>
           </div>
           <div v-else class="history-area"><VBtn class="mb-4" variant="tonal" :loading="saving" :disabled="busy" prepend-icon="mdi-refresh" @click="reconcile">核对待确认结果</VBtn><VExpansionPanels v-if="runs.length" variant="accordion"><VExpansionPanel v-for="run in runs" :key="run.id"><VExpansionPanelTitle><span>{{ dateTime(run.started_at) }} · {{ actionName(run.action) }}</span><VSpacer /><span class="text-caption mr-3">确认 {{ run.items.filter(i => i.status === 'confirmed').length }} / {{ run.items.length }}</span></VExpansionPanelTitle><VExpansionPanelText><VAlert v-if="run.summary" :type="run.status === 'failed' ? 'error' : 'info'" variant="tonal" class="mb-3">{{ run.summary }}</VAlert><div v-for="item in run.items" :key="item.hash" class="history-item"><VChip size="small" :color="item.status === 'confirmed' ? 'success' : 'warning'" variant="tonal">{{ resultName(item.status) }}</VChip><div><div class="torrent-name">{{ item.name }}</div><div class="text-caption text-medium-emphasis">{{ item.reason?.replaceAll('；', '，') }}</div></div></div><p v-if="run.status === 'running'" class="text-body-2">正在处理，结果会自动刷新。</p></VExpansionPanelText></VExpansionPanel></VExpansionPanels><div v-else class="empty-state"><VIcon icon="mdi-history" size="48" color="primary" /><h4>还没有执行记录</h4><p>处理任务后，这里会保留结果和下载器确认情况。</p></div></div>
-        </template>
+        </section></template>
         <div v-else class="empty-state welcome"><VIcon icon="mdi-delete-outline" size="56" color="primary" /><h3>把清理规则分开管理</h3><p>为不同下载器和站点建立独立任务。<br>从预览开始，确认范围后再启用处理动作。</p><VBtn color="primary" prepend-icon="mdi-plus" @click="openEditor()">新建第一个任务</VBtn></div>
       </main>
     </div>
@@ -181,37 +205,35 @@ onUnmounted(() => clearInterval(timer))
     <VDialog v-model="settingsOpen" max-width="1080" scrollable><VCard><VToolbar color="transparent"><VToolbarTitle>站点适配与保护</VToolbarTitle><VSpacer /><VBtn color="primary" :loading="saving" @click="saveSettings">保存</VBtn><VBtn icon="mdi-close" aria-label="关闭站点设置" @click="settingsOpen = false" /></VToolbar><VDivider /><VCardText>
       <VAlert type="info" variant="tonal" class="mb-4">站点列表实时读取 MoviePilot 的“站点管理”（当前 {{ state.options.sites.length }} 个）。新增或修改站点后重新打开本页即可同步，网站地址与登录凭据仍在站点管理中维护。</VAlert>
       <div class="d-flex ga-6 flex-wrap align-start"><VSwitch v-model="settingsDraft.enabled" label="启用定时任务和手动执行" hide-details inset color="primary" /><VSwitch v-model="settingsDraft.show_sidebar" label="显示侧栏入口" hide-details inset color="primary" /><VSwitch v-model="settingsDraft.show_preview" label="显示候选预览" hide-details inset color="primary" /></div>
-      <p class="text-caption text-medium-emphasis mt-2 mb-4">“显示候选预览”只控制预览是否显示。关闭后，已启用策略仍按计划执行，结果查看执行记录。</p>
-      <VAlert type="info" variant="tonal" class="mb-5">保种要求默认“未知”，会阻止处理。按站点规则选择“无 H&amp;R 要求”或设置最低累计时长，个别种子的 H&amp;R 仍需通过保护标签保留。本插件不声称已同步站点账号的 H&amp;R 清单。</VAlert>
-      <VExpansionPanels variant="accordion"><VExpansionPanel v-for="site in settingsDraft.sites" :key="site.site_id"><VExpansionPanelTitle>{{ siteName(site.site_id) }}<VChip class="ml-3" size="x-small" :color="site.hr_mode === 'unknown' ? 'warning' : 'primary'">{{ site.hr_mode === 'unknown' ? '保种要求待配置' : '已配置' }}</VChip><VChip class="ml-2" size="x-small" :color="site.verification === 'unsupported' ? 'warning' : 'success'">{{ site.verification === 'unsupported' ? '详情未适配' : site.verification === 'mteam' ? '馒头 API 已配置' : 'NexusPHP 已配置' }}</VChip></VExpansionPanelTitle><VExpansionPanelText><VRow>
+      <VAlert type="info" variant="tonal" class="my-4">H&R 识别与解除条件在助手中配置，清理任务各自选择保护标签，选用 H&R 标签后会跟随改名。</VAlert>
+      <p class="text-caption text-medium-emphasis mt-2 mb-4">关闭候选预览不影响定时执行，结果可在执行记录中查看。</p>
+      <VExpansionPanels variant="accordion"><VExpansionPanel v-for="site in settingsDraft.sites" :key="site.site_id"><VExpansionPanelTitle>{{ siteName(site.site_id) }}<VChip class="ml-2" size="x-small" :color="site.verification === 'unsupported' ? 'warning' : 'success'">{{ site.verification === 'unsupported' ? '详情未适配' : site.verification === 'mteam' ? '馒头 API 已配置' : 'NexusPHP 已配置' }}</VChip></VExpansionPanelTitle><VExpansionPanelText><VRow>
         <VCol cols="12"><p class="text-caption text-medium-emphasis">MoviePilot 已有认证：{{ state.options.sites.find(s => s.value === site.site_id)?.auth_types?.join(' / ') || '未配置' }}。已有认证不代表本站已接入详情核验适配。</p></VCol>
         <VCol cols="12"><div class="text-subtitle-1 mb-2">域名与身份</div><p class="text-body-2 text-medium-emphasis">网站：{{ state.options.sites.find(s => s.value === site.site_id)?.domain }}。网站地址、Cookie / API Key、请求头和代理沿用 MoviePilot 站点管理，无需重复填写凭据。</p></VCol>
-        <VCol cols="12"><VCombobox v-model="site.tracker_hosts" multiple chips closable-chips label="关联 Tracker 域名" hint="精确匹配主机名，可配置多个。网站子域自动匹配，网站与 Tracker 是不同子域时，请在此补充。不要填写完整链接或 passkey。" persistent-hint /></VCol>
-        <VCol cols="12" md="6"><VSelect v-model="site.hr_mode" label="站点保种要求" :items="[{ title: '未知，保留任务', value: 'unknown' }, { title: '本站无 H&R 要求', value: 'none' }, { title: '按最低累计做种时长保护', value: 'minimum' }]" /></VCol>
-        <VCol cols="12" md="6"><VTextField v-model="site.min_seed_hours" :disabled="site.hr_mode !== 'minimum'" type="number" min="0" label="站点最低累计做种（小时）" /></VCol>
+        <VCol cols="12"><VCombobox v-model="site.tracker_hosts" multiple chips closable-chips label="关联 Tracker 域名" hint="网站子域自动匹配，Tracker 域名不同时在此补充，仅填主机名，可配置多个，不填完整链接或 passkey。" persistent-hint /></VCol>
         <VCol cols="12"><VSelect v-model="site.verification" label="站点详情复核" :items="[{ title: '未适配：失效结果保持未知', value: 'unsupported' }, { title: 'NexusPHP：使用 MoviePilot 中的 Cookie', value: 'nexusphp' }, { title: '馒头 API：复用 MoviePilot API Key（x-api-key）', value: 'mteam' }]" /></VCol>
         <VCol cols="12"><VBtn variant="tonal" size="small" @click="Object.assign(site, { verification: 'nexusphp', auto_discover: true, search_url_template: '/torrents.php?search={keyword}&search_area=0&search_mode=0&incldead=0', detail_path: '/details.php', detail_id_param: 'id' })">填入 NexusPHP 标准规则</VBtn><p class="text-caption text-medium-emphasis mt-2">适用于兼容 NexusPHP 的站点（已验证 CARPT、观众），填入后仍可修改。馒头使用独立 API，不能套用此规则。</p></VCol>
-        <VCol v-if="site.verification === 'mteam'" cols="12"><VTextField v-model="site.api_url" label="API 服务地址（可留空自动推导）"  :placeholder="state.options.sites.find(s => s.value === site.site_id)?.api_url || 'https://api.m-team.cc/api'" hint="留空优先复用宿主索引 API 地址。API Key 直接读取站点管理。鉴权失败保持未知，缺少 Hash 可启用下方种子文件核验。" persistent-hint /></VCol>
+        <VCol v-if="site.verification === 'mteam'" cols="12"><VTextField v-model="site.api_url" label="API 服务地址（可留空自动推导）"  :placeholder="state.options.sites.find(s => s.value === site.site_id)?.api_url || 'https://api.m-team.cc/api'" hint="留空复用宿主索引 API，凭据读取站点管理，鉴权失败保持未知，缺少 Hash 可启用下方种子文件核验。" persistent-hint /></VCol>
         <template v-if="['nexusphp', 'mteam'].includes(site.verification)">
           <VCol cols="12"><VDivider class="mb-4" /><div class="text-subtitle-1">自动查找规则</div><VSwitch v-model="site.auto_discover" label="无已有关联时自动查找详情页" color="primary" hide-details /><p class="text-body-2 text-medium-emphasis mt-2">先查最近 500 条下载记录和下载器备注，再使用下面的搜索模板。任何候选都必须核实详情页 Hash，搜索无结果不会判定失效。</p></VCol>
-          <VCol v-if="site.verification === 'nexusphp'" cols="12"><VTextField v-model="site.search_url_template" label="站内搜索模板（留空跳过搜索）" placeholder="/torrents.php?search={hash}" hint="仅填写本站相对路径。{hash}=种子 Hash，{name}=完整名称，{keyword}=提取的标题关键词，按本站实际支持的参数配置。" persistent-hint /></VCol>
+          <VCol v-if="site.verification === 'nexusphp'" cols="12"><VTextField v-model="site.search_url_template" label="站内搜索模板（留空跳过搜索）" placeholder="/torrents.php?search={hash}" hint="填写本站相对路径，{hash} 为 Hash，{name} 为完整名称，{keyword} 为标题关键词，参数须受本站支持" persistent-hint /></VCol>
           <VCol v-if="site.verification === 'nexusphp'" cols="12" md="6"><VTextField v-model="site.detail_path" label="详情页路径" placeholder="/details.php" /></VCol>
           <VCol v-if="site.verification === 'nexusphp'" cols="12" md="6"><VTextField v-model="site.detail_id_param" label="详情页 ID 参数名" placeholder="id" /></VCol>
-          <VCol cols="12"><VDivider class="mb-4" /><div class="text-subtitle-1">访问频率</div><p class="text-body-2 text-medium-emphasis mt-2">任务按自己的 Cron 运行，下列缓存和请求限额按站点共享。重复预览或核验按钮不会绕过缓存。执行清理前要求新证据，仍受限流保护。</p></VCol>
+          <VCol cols="12"><VDivider class="mb-4" /><div class="text-subtitle-1">访问频率</div><p class="text-body-2 text-medium-emphasis mt-2">任务按各自 Cron 运行，缓存和请求限额按站点共享，重复预览或核验不会绕过缓存。执行前重新获取证据，仍受请求限额约束。</p></VCol>
           <VCol cols="12" md="6"><VTextField v-model="site.check_interval_hours" type="number" min="1" max="168" label="存在状态缓存有效期（小时）" /></VCol>
           <VCol cols="12" md="6"><VTextField v-model="site.request_gap_seconds" type="number" min="1" max="30" label="本站请求最小间隔（秒）" /></VCol>
           <VCol cols="12" md="6"><VTextField v-model="site.max_requests_per_hour" type="number" min="1" max="120" label="所有请求合计每小时预算（包括重定向）" /></VCol>
           <VCol cols="12" md="6"><VTextField v-model="site.max_detail_candidates" type="number" min="1" max="10" label="每个来源最多核验候选页数" /></VCol>
-          <VCol cols="12"><VDivider class="my-3" /><div class="text-subtitle-1">按请求类别限制配额</div><p class="text-caption mt-2">同站点所有任务共享，重启不清零。0 表示禁止该类请求。以下配额与总请求预算同时生效，仅统计本插件用量，不包含 MoviePilot 其他功能和外部工具。</p></VCol>
+          <VCol cols="12"><VDivider class="my-3" /><div class="text-subtitle-1">按请求类别限制配额</div><p class="text-caption mt-2">同站点所有任务共享配额，重启不清零，0 表示禁止该类请求。分类配额与总请求预算同时生效，仅统计本插件用量。</p></VCol>
           <VCol cols="12" md="6"><VTextField v-model="site.detail_requests_per_hour" type="number" min="0" label="详情每小时最多请求次数" /></VCol>
           <VCol cols="12" md="6"><VTextField v-model="site.search_requests_per_day" type="number" min="0" label="搜索滚动 24 小时最多请求次数" /></VCol>
           <VCol cols="12" md="6"><VTextField v-model="site.torrent_downloads_per_hour" type="number" min="0" label="种子文件每小时最多下载次数" /></VCol>
           <VCol cols="12" md="6"><VTextField v-model="site.torrent_downloads_per_day" type="number" min="0" label="种子文件滚动 24 小时最多下载次数" /></VCol>
           <VCol cols="12"><div v-for="q in state.quotas?.[site.site_id] || []" :key="q.title" class="text-caption mb-2">{{ q.title }}：已用 {{ q.used }} / {{ q.limit }}<span v-if="q.blocked">，{{ q.next_at ? '下次释放：' + dateTime(q.next_at) : '已禁止此类请求' }}</span></div></VCol>
-          <VCol cols="12"><VDivider class="my-3" /><div class="text-subtitle-1">种子文件核验与缓存</div><VSwitch v-model="site.allow_torrent_verification" label="缺少 Hash 时允许下载种子文件核验身份" color="primary" hide-details /><p class="text-caption mt-3">只下载 .torrent 元信息并计算 Hash。已验证的身份关联长期保存，不代表种子仍存在。Tracker 正常不请求站点，不做周期性站点复核。额度不足或下载失败保持未知。</p></VCol>
+          <VCol cols="12"><VDivider class="my-3" /><div class="text-subtitle-1">种子文件核验与缓存</div><VSwitch v-model="site.allow_torrent_verification" label="缺少 Hash 时允许下载种子文件核验身份" color="primary" hide-details /><p class="text-caption mt-3">下载 .torrent 计算 Hash，验证后的身份关联长期保存，不代表种子仍存在。仅在 Tracker 异常时复核站点，额度不足或下载失败则保持未知。</p></VCol>
           <VCol cols="12" md="6"><VTextField v-model="site.error_cache_minutes" type="number" min="1" max="1440" label="失败或未知结果退避时间（分钟）" /></VCol>
-          <VCol v-if="site.verification === 'nexusphp'" cols="12"><VTextField v-model="site.torrent_download_path" label="种子下载路径模板" hint="本站相对路径，例如 /download.php?id={id}。ID 从已配置详情地址提取。" persistent-hint /></VCol>
-          <VCol cols="12"><VCombobox v-model="site.torrent_download_hosts" multiple chips closable-chips label="允许种子下载跳转的分发域名" hint="仅填已确认的精确主机名，按回车添加。不会向这些分发域名发送 API Key 或站点 Cookie。" persistent-hint /></VCol>
+          <VCol v-if="site.verification === 'nexusphp'" cols="12"><VTextField v-model="site.torrent_download_path" label="种子下载路径模板" hint="填写本站相对路径，如 /download.php?id={id}，ID 从详情地址提取" persistent-hint /></VCol>
+          <VCol cols="12"><VCombobox v-model="site.torrent_download_hosts" multiple chips closable-chips label="允许种子下载跳转的分发域名" hint="回车添加精确主机名，分发请求不携带站点 API Key 或 Cookie" persistent-hint /></VCol>
         </template>
       </VRow></VExpansionPanelText></VExpansionPanel></VExpansionPanels>
     </VCardText></VCard></VDialog>
@@ -220,8 +242,8 @@ onUnmounted(() => clearInterval(timer))
     <VDialog v-model="bindOpen" max-width="680"><VCard title="详情识别与核验"><VCardText class="binding-fields">
       <VSelect v-model="bindDraft.site_id" :items="state.options.sites.filter(s => task?.site_ids.includes(s.value))" label="站点" hide-details />
       <VAlert v-if="currentBinding" type="success" variant="tonal"><div>已识别并保存 · {{ currentBinding.source }}</div><div class="text-caption mt-1">身份 Hash 核实：{{ dateTime(currentBinding.hash_verified_at || currentBinding.verified_at) }}。最近确认存在：{{ dateTime(currentBinding.verified_at) }}</div><a class="binding-url" :href="currentBinding.url" target="_blank" rel="noopener noreferrer">{{ currentBinding.url }}</a></VAlert>
-      <VAlert v-else-if="!bindingPolicy || bindingPolicy.verification === 'unsupported'" type="warning" variant="tonal">本站尚未配置详情核验适配，当前不能自动查找。请先在“站点与保护”选择适配方式。</VAlert>
-      <VAlert v-else type="info" variant="tonal">尚未找到经过 Hash 核实的详情。点击“自动查找并保存”开始查找，成功后会在这里显示链接。</VAlert>
+      <VAlert v-else-if="!bindingPolicy || bindingPolicy.verification === 'unsupported'" type="warning" variant="tonal">请先在“站点与保护”配置核验适配，再自动查找详情。</VAlert>
+      <VAlert v-else type="info" variant="tonal">点击“自动查找并保存”核实 Hash，成功后显示详情链接。</VAlert>
       <div><VTextField v-model="bindDraft.url" label="详情链接（自动识别后回填，也可手动填写）" hide-details /><p class="binding-help">留空时按本站规则自动查找，填写链接时核实该链接。只有 Hash 完全一致才保存关联。</p></div>
       <div class="binding-identity"><div class="text-caption text-medium-emphasis mb-2">种子 Hash</div><code>{{ bindDraft.hash }}</code></div>
       <VAlert v-if="error" type="error" variant="tonal">{{ error }}</VAlert>
@@ -231,7 +253,20 @@ onUnmounted(() => clearInterval(timer))
 </template>
 
 <style scoped>
+.task-drag-handle{cursor:grab;opacity:.6}
+
+.task-row{display:flex;flex-direction:column;margin-bottom:12px;border:1px solid rgba(var(--v-theme-on-surface),.12);border-radius:12px;overflow:hidden;background:rgb(var(--v-theme-surface));cursor:pointer}.task-row.selected{border-color:rgb(var(--v-theme-primary));background:rgba(var(--v-theme-primary),.06)}.task-row .task-button{min-width:0;width:100%;margin-bottom:0;border:0;background:transparent}.task-order{display:flex;justify-content:flex-end;gap:4px;padding:0 8px 6px}
 .scan-progress{margin-top:16px;padding:16px;border-radius:10px;background:rgba(var(--v-theme-primary),.06);font-size:13px;line-height:1.7}.scan-current{overflow-wrap:anywhere}
 .binding-fields{display:flex;flex-direction:column;gap:22px;padding-top:12px!important}.binding-help{margin:10px 0 0;font-size:12px;line-height:1.7;color:rgba(var(--v-theme-on-surface),.65)}.binding-identity{border-top:1px solid rgba(var(--v-border-color),var(--v-border-opacity));padding-top:18px}.binding-identity code,.binding-url{overflow-wrap:anywhere;word-break:break-all}.binding-identity code{font-size:13px;line-height:1.8}.binding-url{display:block;margin-top:8px;font-size:13px}
-.cleanup-workbench{padding:24px;color:rgb(var(--v-theme-on-surface));font-family:inherit}.cleanup-header{display:flex;justify-content:space-between;align-items:center;gap:20px;margin-bottom:24px}.cleanup-layout{display:grid;grid-template-columns:280px minmax(0,1fr);gap:20px;min-height:560px}.cleanup-task-list,.cleanup-detail{border:1px solid rgba(var(--v-border-color),var(--v-border-opacity));border-radius:12px;background:rgb(var(--v-theme-surface))}.cleanup-task-list{padding:12px;height:fit-content}.list-caption{display:flex;align-items:center;justify-content:space-between;padding:8px 10px 16px;font-size:13px;color:rgba(var(--v-theme-on-surface),.6)}.task-button{display:block;width:100%;text-align:left;padding:16px 14px;border:1px solid transparent;border-radius:8px;margin-bottom:8px;color:inherit;transition:background .15s;overflow-wrap:anywhere}.task-button:hover{background:rgba(var(--v-theme-primary),.04)}.task-button.selected{background:rgba(var(--v-theme-primary),.07);border-color:rgba(var(--v-theme-primary),.25)}.task-subtitle{font-size:12px;color:rgba(var(--v-theme-on-surface),.6);margin-top:7px}.status-dot{width:7px;height:7px;border-radius:50%;background:rgba(var(--v-theme-on-surface),.25);flex-shrink:0}.status-dot.on{background:rgb(var(--v-theme-success))}.cleanup-detail{padding:24px;min-width:0}.detail-header{display:flex;justify-content:space-between;align-items:center;gap:12px}.summary-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:24px 0 16px}.summary-grid>div{background:rgba(var(--v-theme-on-surface),.025);padding:16px;border-radius:8px}.summary-grid span{display:block;font-size:12px;color:rgba(var(--v-theme-on-surface),.6);margin-bottom:10px}.summary-grid strong{font-size:23px;font-weight:600}.summary-grid small{font-size:12px;font-weight:400}.summary-grid .action-summary{font-size:16px}.policy-summary{display:flex;align-items:center;gap:8px;background:rgba(var(--v-theme-primary),.045);padding:12px 14px;border-radius:8px;font-size:12px;line-height:1.7;margin-bottom:24px}.tab-toolbar{display:flex;justify-content:space-between;align-items:center;gap:12px;border-bottom:1px solid rgba(var(--v-border-color),var(--v-border-opacity));padding-bottom:10px;flex-wrap:wrap}.preview-caption{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:12px;color:rgba(var(--v-theme-on-surface),.6);padding:12px 0}.torrent-name{font-size:13px;overflow-wrap:anywhere;line-height:1.55;min-width:120px;max-width:360px}.reason-list{font-size:12px;line-height:1.6;color:rgba(var(--v-theme-on-surface),.65);margin-top:6px;min-width:160px;max-width:300px}.empty-state{text-align:center;padding:64px 18px;color:rgba(var(--v-theme-on-surface),.65)}.empty-state h4,.empty-state h3{margin:20px 0 8px;color:rgb(var(--v-theme-on-surface));font-weight:500}.empty-state p{font-size:14px;line-height:1.8;margin-bottom:22px}.welcome{padding-top:110px}.history-area{padding-top:20px}.history-item{display:flex;gap:12px;align-items:start;padding:12px 0;border-bottom:1px solid rgba(var(--v-border-color),.1)}.cleanup-table :deep(td){padding-block:14px!important}.cleanup-table :deep(th){font-size:12px!important;white-space:nowrap}@media(max-width:1100px){.cleanup-layout{grid-template-columns:220px minmax(0,1fr)}.summary-grid{grid-template-columns:repeat(2,1fr)}.cleanup-detail{padding:16px}.cleanup-header{align-items:flex-start;flex-direction:column}}@media(max-width:700px){.cleanup-workbench{padding:12px}.cleanup-layout{grid-template-columns:1fr}.cleanup-task-list{max-height:280px;overflow:auto}.detail-header{align-items:flex-start}.preview-caption{flex-wrap:wrap}.tab-toolbar{gap:16px}.summary-grid strong{font-size:20px}}
+.cleanup-workbench{padding:24px;color:rgb(var(--v-theme-on-surface));font-family:inherit}.cleanup-header{display:flex;justify-content:space-between;align-items:center;gap:20px;margin-bottom:24px}.cleanup-layout{display:grid;grid-template-columns:280px minmax(0,1fr);gap:24px;min-height:560px}.cleanup-task-list,.cleanup-detail{border:1px solid rgba(var(--v-border-color),var(--v-border-opacity));border-radius:12px;background:rgb(var(--v-theme-surface))}.cleanup-task-list{padding:0;height:fit-content;border:0;border-radius:0;background:transparent}.list-caption{display:flex;align-items:center;justify-content:space-between;padding:8px 10px 16px;font-size:13px;color:rgba(var(--v-theme-on-surface),.6)}.task-button{display:block;width:100%;text-align:left;padding:16px 14px;border:1px solid transparent;border-radius:8px;margin-bottom:8px;color:inherit;transition:background .15s;overflow-wrap:anywhere}.task-button:hover{background:rgba(var(--v-theme-primary),.04)}.task-button.selected{background:transparent}.task-subtitle{font-size:12px;color:rgba(var(--v-theme-on-surface),.6);margin-top:7px}.status-dot{width:7px;height:7px;border-radius:50%;background:rgba(var(--v-theme-on-surface),.25);flex-shrink:0}.status-dot.on{background:rgb(var(--v-theme-success))}.cleanup-detail{padding:24px;min-width:0}.detail-header{display:flex;justify-content:space-between;align-items:center;gap:12px}.summary-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:24px 0 16px}.summary-grid>div{background:rgba(var(--v-theme-on-surface),.025);padding:16px;border-radius:8px}.summary-grid span{display:block;font-size:12px;color:rgba(var(--v-theme-on-surface),.6);margin-bottom:10px}.summary-grid strong{font-size:23px;font-weight:600}.summary-grid small{font-size:12px;font-weight:400}.summary-grid .action-summary{font-size:16px}.policy-summary{display:flex;align-items:center;gap:8px;background:rgba(var(--v-theme-primary),.045);padding:12px 14px;border-radius:8px;font-size:12px;line-height:1.7;margin-bottom:24px}.tab-toolbar{display:flex;justify-content:space-between;align-items:center;gap:12px;border-bottom:1px solid rgba(var(--v-border-color),var(--v-border-opacity));padding-bottom:10px;flex-wrap:wrap}.preview-caption{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:12px;color:rgba(var(--v-theme-on-surface),.6);padding:12px 0}.torrent-name{font-size:13px;overflow-wrap:anywhere;line-height:1.55;min-width:120px;max-width:360px}.reason-list{font-size:12px;line-height:1.6;color:rgba(var(--v-theme-on-surface),.65);margin-top:6px;min-width:160px;max-width:300px}.empty-state{text-align:center;padding:64px 18px;color:rgba(var(--v-theme-on-surface),.65)}.empty-state h4,.empty-state h3{margin:20px 0 8px;color:rgb(var(--v-theme-on-surface));font-weight:500}.empty-state p{font-size:14px;line-height:1.8;margin-bottom:22px}.welcome{padding-top:110px}.history-area{padding-top:20px}.history-item{display:flex;gap:12px;align-items:start;padding:12px 0;border-bottom:1px solid rgba(var(--v-border-color),.1)}.cleanup-table :deep(td){padding-block:14px!important}.cleanup-table :deep(th){font-size:12px!important;white-space:nowrap}@media(max-width:1100px){.cleanup-layout{grid-template-columns:220px minmax(0,1fr)}.summary-grid{grid-template-columns:repeat(2,1fr)}.cleanup-detail{padding:16px}.cleanup-header{align-items:flex-start;flex-direction:column}}@media(max-width:700px){.cleanup-workbench{padding:12px}.cleanup-layout{grid-template-columns:1fr}.cleanup-task-list{max-height:280px;overflow:auto}.detail-header{align-items:flex-start}.preview-caption{flex-wrap:wrap}.tab-toolbar{gap:16px}.summary-grid strong{font-size:20px}}
+
+.cleanup-detail{padding:0!important;border:0;background:transparent;border-radius:0}
+.detail-header,.cleanup-content-card,.policy-summary,.summary-grid>div{border:var(--app-surface-border,1px solid rgba(var(--v-theme-on-surface),.12));border-radius:var(--app-surface-radius,12px);background:rgb(var(--v-theme-surface))}
+.detail-header{padding:20px 24px;margin-bottom:20px;gap:20px}
+.summary-grid{margin:0 0 20px}.summary-grid>div{padding:20px;min-height:108px}
+.policy-summary{padding:16px 20px;margin-bottom:20px}
+.cleanup-content-card{padding:24px;min-width:0;overflow:hidden}
+@media(max-width:700px){.detail-header,.cleanup-content-card{padding:16px}.detail-header{flex-wrap:wrap}}
+.rail-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.rail-details{display:grid;gap:4px;margin-top:6px}.rail-row{display:grid;grid-template-columns:64px minmax(0,1fr);align-items:center;gap:6px;min-height:24px}.rail-pill{display:inline-block;justify-self:start;max-width:100%;min-width:0;padding:2px 8px;border-radius:999px;background:rgba(var(--v-theme-primary),.09);border:1px solid rgba(var(--v-theme-primary),.12);color:rgb(var(--v-theme-on-surface));font-size:11px;line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-variant-numeric:tabular-nums}.rail-label,.rail-neutral{background:rgba(var(--v-theme-on-surface),.04);border-color:rgba(var(--v-theme-on-surface),.07);color:rgba(var(--v-theme-on-surface),.65)}.rail-accent{color:rgb(var(--v-theme-primary))}.rail-warn{color:rgb(var(--v-theme-warning));background:rgba(var(--v-theme-warning),.08);border-color:rgba(var(--v-theme-warning),.15)}
+.task-button strong{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.task-order{margin-top:2px}.task-row .task-button{padding:14px 14px 6px}
 </style>

@@ -5,7 +5,7 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit, urljoin
 
@@ -39,6 +39,9 @@ class Snapshot:
     managed: bool = False
     error_message: str = ''
     has_error: bool = False
+    uploaded: float | None = None
+    total_size: float | None = None
+    hr_identified: bool | None = None
 
 
 def numeric(value):
@@ -50,7 +53,7 @@ def numeric(value):
         return None
 
 
-def map_files(files: list[dict], save_path: str, mappings: list) -> tuple[frozenset[str], list[str], bool]:
+def map_files(files: list[dict], save_path: str, mappings: list, allow_incomplete=False) -> tuple[frozenset[str], list[str], bool]:
     """根据下载器映射验证文件，并同时保留路径及 inode 引用身份。"""
     identities, paths = set(), []
     if not files or not mappings:
@@ -68,25 +71,53 @@ def map_files(files: list[dict], save_path: str, mappings: list) -> tuple[frozen
                 return frozenset(), [], False
             local_root, remote_root = max(candidates, key=lambda pair: len(pair[1].parts))
             file_path = local_root / remote.relative_to(remote_root)
-            resolved = file_path.resolve(strict=True)
+            resolved = file_path.resolve(strict=not allow_incomplete)
             if not resolved.is_relative_to(local_root.resolve(strict=True)) or file_path.is_symlink():
                 return frozenset(), [], False
-            stat = file_path.stat()
-            if not file_path.is_file() or stat.st_size != file["size"]:
+            identities.add("path:" + str(resolved))
+            if file_path.exists():
+                stat = file_path.stat()
+                if not file_path.is_file() or (stat.st_size > file["size"] if allow_incomplete else stat.st_size != file["size"]):
+                    return frozenset(), [], False
+                identities.add(f"inode:{stat.st_dev}:{stat.st_ino}")
+            elif not allow_incomplete:
                 return frozenset(), [], False
-            identities.update({"path:" + str(resolved), f"inode:{stat.st_dev}:{stat.st_ino}"})
             paths.append(str(resolved))
     except (OSError, ValueError, TypeError, KeyError):
         return frozenset(), [], False
     return frozenset(identities), paths, True
 
 
+def map_incomplete_files(files, save_path, download_path, mappings, preferences):
+    """核实未完成文件的最终目录、临时目录及 .!qB 名称，仍按路径/inode 防共享删除。"""
+    if not isinstance(preferences.get('temp_path_enabled'), bool) or not isinstance(preferences.get('incomplete_files_ext'), bool):
+        return frozenset(), [], False
+    roots = {save_path}
+    if preferences['temp_path_enabled']:
+        # 每种子的分类目录可能不同，不能用全局临时目录猜测。
+        if not download_path or not os.path.isabs(download_path):
+            return frozenset(), [], False
+        roots.add(download_path)
+    names = list(files)
+    if preferences['incomplete_files_ext']:
+        names += [{**f, 'name': f['name'] + '.!qB'} for f in files]
+    identities, paths = set(), set()
+    for root in roots:
+        found, local, valid = map_files(names, root, mappings, allow_incomplete=True)
+        if not valid:
+            return frozenset(), [], False
+        identities.update(found)
+        paths.update(local)
+    return frozenset(identities), sorted(paths), True
+
+
 class Gateway:
     """使用宿主服务实例、HTTP 工具及站点 Cookie 提供窄操作接口。"""
 
-    def __init__(self, site_policies: list[SitePolicy]):
+    def __init__(self, site_policies: list[SitePolicy], hr_auto_release=False):
         """建立本轮独立适配器，站点凭据只保存在内存中。"""
         self.helper = DownloaderHelper()
+        self.hr_auto_release = hr_auto_release
         self.policies = {p.site_id: p for p in site_policies}
         self.sites = {s["id"]: s for s in self.read_sites()}
         self.verifier = None
@@ -279,19 +310,22 @@ class Gateway:
                 matches.append(site["id"])
         return matches[0] if len(matches) == 1 else None
 
-    def snapshot(self, name: str, manifests: bool = False, error_only: bool = False) -> list[Snapshot]:
+    def snapshot(self, name: str, manifests: bool = False, error_only: bool = False, hashes=None) -> list[Snapshot]:
         """获取累计做种时间和所有 Tracker，删文件预览额外读取完整文件清单。"""
         service = self.service(name)
         instance = service.instance
+        preferences = {}
         if service.type == "qbittorrent":
-            rows = instance.qbc.torrents_info()
+            if manifests:
+                preferences = instance.qbc.app_preferences()
+            rows = instance.qbc.torrents_info(**({'torrent_hashes': '|'.join(hashes)} if hashes else {}))
         else:
             fields = ["hashString", "name", "status", "labels", "totalSize", "percentDone",
                       "leftUntilDone", "secondsSeeding", "uploadRatio", "downloadDir",
-                      "error", "errorString", "trackerStats", "comment", "addedDate", "downloadedEver", "rateDownload", "rateUpload"]
+                      "error", "errorString", "trackerStats", "comment", "addedDate", "downloadedEver", "uploadedEver", "rateDownload", "rateUpload"]
             if manifests:
                 fields.append("files")
-            rows = instance.trc.get_torrents(arguments=fields)
+            rows = instance.trc.get_torrents(arguments=fields, **({'ids': list(hashes)} if hashes else {}))
         result = []
         for item in rows:
             qb = service.type == "qbittorrent"
@@ -329,14 +363,19 @@ class Gateway:
                        if qb else item.get("status") in {0, 5, 6} and item.get("error") != 3)
             hr = None
             profiles = [self.policies.get(s) for s in trackers]
-            if profiles and all(p and p.hr_mode != "unknown" for p in profiles):
-                hr = any(p.hr_mode == "minimum" and (seed is None or seed < p.min_seed_hours * 3600)
+            if profiles and all(p and p.hr_mode in {'none', 'minimum'} for p in profiles):
+                # 本地保种目标只约束已完成任务，不把未完成下载误当作 H&R。
+                hr = any(p.hr_mode == "minimum" and progress == 1 and left == 0
+                         and (seed is None or seed < p.min_seed_hours * 3600)
                          for p in profiles)
             identities, paths, verified = frozenset(), [], False
             if manifests:
                 raw_files = instance.qbc.torrents_files(torrent_hash=h) if qb else item.get("files", [])
                 files = [{"name": f.get("name"), "size": f.get("size" if qb else "length")} for f in raw_files]
-                identities, paths, verified = map_files(files, path, service.config.path_mapping)
+                if qb and progress is not None and 0 <= progress < 1 and left is not None and left > 0:
+                    identities, paths, verified = map_incomplete_files(files, path, item.get('download_path'), service.config.path_mapping, preferences)
+                else:
+                    identities, paths, verified = map_files(files, path, service.config.path_mapping)
             torrent = Torrent(name, h, str(item.get("name") or h), frozenset(trackers), complete,
                               progress == 1 and left == 0, healthy, seed, ratio, int(size or 0),
                               frozenset(tags), hr, identities, verified)
@@ -347,11 +386,36 @@ class Gateway:
                 client_state=str(item.get('state') or '') if qb else str(item.get('status', '')),
                 progress=progress, added_at=numeric(item.get('added_on') if qb else item.get('addedDate')),
                 downloaded=numeric(item.get('downloaded') if qb else item.get('downloadedEver')),
+                uploaded=numeric(item.get('uploaded') if qb else item.get('uploadedEver')),
+                total_size=numeric(item.get('total_size') if qb else item.get('totalSize')),
                 download_speed=numeric(item.get('dlspeed') if qb else item.get('rateDownload')),
                 upload_speed=numeric(item.get('upspeed') if qb else item.get('rateUpload')),
                 category=str(item.get('category') or ''), managed=bool(getattr(settings, 'TORRENT_TAG', '') and settings.TORRENT_TAG in tags),
                 error_message=error_message, has_error=(str(item.get('state', '')).lower() in {'error', 'missingfiles'} if qb else item.get('error', 0) != 0)))
         return result
+
+    def hr_tags(self, downloader, torrent_hash, add=frozenset(), remove=frozenset()):
+        """读取最新标签后合并，读回确认，保留下载器的其他所有标签。"""
+        service = self.service(downloader)
+        client = service.instance.qbc if service.type == 'qbittorrent' else service.instance.trc
+        def read():
+            rows = (client.torrents_info(torrent_hashes=torrent_hash) if service.type == 'qbittorrent'
+                    else client.get_torrents(ids=[torrent_hash], arguments=['hashString', 'labels']))
+            if len(rows) != 1:
+                raise RuntimeError('种子尚未出现或已被移除')
+            tags = rows[0].get('tags' if service.type == 'qbittorrent' else 'labels') or []
+            return {v.strip() for v in tags.split(',') if v.strip()} if isinstance(tags, str) else set(tags)
+        current = read()
+        if service.type == 'qbittorrent':
+            if add:
+                client.torrents_add_tags(torrent_hashes=torrent_hash, tags=','.join(sorted(add)))
+            if remove:
+                client.torrents_remove_tags(torrent_hashes=torrent_hash, tags=','.join(sorted(remove)))
+        else:
+            client.change_torrent(ids=[torrent_hash], labels=sorted((current | set(add)) - set(remove)))
+        actual = read()
+        if not set(add).issubset(actual) or set(remove) & actual:
+            raise RuntimeError('标签更新未确认')
 
     def inventory(self) -> tuple[list[Snapshot], bool]:
         """读取所有已配置下载器的文件引用，任一不可读取即判定清单不完整。"""

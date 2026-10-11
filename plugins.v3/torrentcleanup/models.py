@@ -1,5 +1,6 @@
 """清理任务及站点规则的配置合同。"""
 
+import re
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -15,7 +16,13 @@ class SitePolicy(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     site_id: int = Field(gt=0)
     tracker_hosts: list[str] = Field(default_factory=list, max_length=20)
-    hr_mode: Literal["unknown", "none", "minimum"] = "unknown"
+    hr_mode: Literal["unknown", "none", "minimum", "managed"] = "unknown"
+    hr_detection: Literal['marked', 'all'] = 'marked'
+    hr_required_hours: float = Field(default=48, ge=1, le=8760)
+    hr_buffer_hours: float = Field(default=24, ge=1, le=8760)
+    hr_deadline_days: int = Field(default=14, ge=1, le=365)
+    hr_seed_ratio: float = Field(default=0, ge=0, le=1000000)
+    hr_ratio_basis: Literal['client', 'full_size'] = 'client'
     min_seed_hours: float = Field(default=168, ge=0, le=876000)
     verification: Literal["unsupported", "nexusphp", "mteam"] = "unsupported"
     api_url: str = Field(default='', max_length=2048)
@@ -120,6 +127,10 @@ class CleanupTask(BaseModel):
     error_gap_minutes: float = Field(default=15, ge=1, le=1440)
     error_max_progress: float = Field(default=99.9, ge=0, lt=100)
     error_protect_unknown_hr: bool = True
+    hr_local_conditions: bool = False
+    hr_tags: list[str] = Field(default_factory=list, max_length=100)
+    hr_seed_hours: float = Field(default=168, ge=0, le=876000)
+    hr_upload_gb: float = Field(default=0, ge=0, le=100000000)
     action: Literal["preview", "mark", "pause", "delete", "deletefile"] = "preview"
     cron: str = "0 */6 * * *"
     min_seed_hours: float = Field(default=168, ge=0, le=876000)
@@ -135,6 +146,12 @@ class CleanupTask(BaseModel):
     max_count: int = Field(default=10, ge=1, le=100)
     max_gb: float = Field(default=100, gt=0, le=100000)
     notify: bool = False
+
+    @field_validator('hr_tags', 'protect_tags', 'include_tags', mode='before')
+    @classmethod
+    def normalize_tags(cls, values):
+        values = values if isinstance(values, list) else [values]
+        return sorted({tag.strip() for value in values for tag in re.split(r'[,，\n]', str(value or '')) if tag.strip()})
 
     @field_validator("cron")
     @classmethod
@@ -169,7 +186,9 @@ class CleanupTask(BaseModel):
         if self.max_size_gb is not None and self.max_size_gb < self.min_size_gb:
             raise ValueError("体积上限不能小于下限")
         self.include_tags = sorted({v.strip() for v in self.include_tags if v.strip()})
-        self.protect_tags = sorted({v.strip() for v in self.protect_tags if v.strip()} | {"H&R"})
+        self.protect_tags = sorted({v.strip() for v in self.protect_tags if v.strip()})
+        if self.hr_local_conditions and (self.mode != 'conditions' or not (self.hr_seed_hours > 0 or self.hr_upload_gb > 0)):
+            raise ValueError('本地 H&R 条件仅用于按勾选条件筛选，且至少启用时间或上传量一项')
         if self.path_prefix and (not self.path_prefix.startswith("/") or ".." in self.path_prefix.split("/")):
             raise ValueError("目录范围必须为下载器中的绝对路径")
         return self
@@ -190,6 +209,10 @@ class SettingsPayload(BaseModel):
     enabled: bool = False
     show_sidebar: bool = True
     show_preview: bool = True
+    hr_enabled: bool = False
+    hr_downloaders: list[str] = Field(default_factory=list, max_length=30)
+    hr_check_minutes: int = Field(default=15, ge=5, le=120)
+    hr_auto_release: bool = False
     sites: list[SitePolicy] = Field(default_factory=list, max_length=100)
 
     @model_validator(mode="after")
@@ -206,6 +229,26 @@ class RunPayload(BaseModel):
     """手动执行必须引用尚未过期的预览。"""
 
     plan_id: str = Field(min_length=1, max_length=64)
+
+
+class TaskOrderPayload(BaseModel):
+    """提交全部任务的稳定 ID 顺序，服务端校验并发变化。"""
+
+    model_config = ConfigDict(extra='forbid')
+    ids: list[str] = Field(max_length=100)
+
+
+class HRGuardPayload(BaseModel):
+    """供刷流在执行删除前查询实时保护结果。"""
+    downloader: str
+    hashes: list[str] = Field(max_length=10000)
+
+
+class HRResolvePayload(BaseModel):
+    """用户明确确认单个托管任务的 H&R 属性。"""
+    downloader: str
+    hash: str = Field(pattern=r'^[0-9a-fA-F]{40}$')
+    is_hr: bool
 
 
 class BindPayload(BaseModel):

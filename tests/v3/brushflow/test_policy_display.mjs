@@ -36,3 +36,10 @@ test('task overrides are reflected in actual policy text and false remains expli
   assert.equal(inherited.global_seed_ratio, 2)
   assert.equal(inherited.global_del_no_free, true)
 })
+
+test('HR policy is owned by helper; consumer describes labels and shared AND', () => {
+  const text = globalDeleteRules({global_min_seed_hours:168,global_inactive_hours:48,global_hr_seed_time:336})
+  for (const value of ['168 小时','48 小时','H&R 标签由助手维护','且关系']) assert.ok(text.includes(value),value)
+  assert.ok(!text.includes('336'))
+  assert.ok(!text.includes('实时 H&R 联动'))
+})

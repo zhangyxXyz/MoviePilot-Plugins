@@ -1,4 +1,5 @@
 <script setup>
+import TagInput from './TagInput.vue'
 import { computed, ref, watch } from 'vue'
 import { useDisplay } from 'vuetify'
 import { cloneTask, normalizeTask } from '../utils'
@@ -9,10 +10,11 @@ const props = defineProps({
   sites: { type: Array, default: () => [] },
   downloaders: { type: Array, default: () => [] },
   globalDynamicDelete: { type: Boolean, default: false },
+  globalSettings: { type: Object, default: () => ({}) },
   saving: { type: Boolean, default: false },
 })
 
-const emit = defineEmits(['update:modelValue', 'save'])
+const emit = defineEmits(['update:modelValue', 'save', 'open-global'])
 const display = useDisplay()
 const formRef = ref(null)
 const activeTab = ref('base')
@@ -21,6 +23,18 @@ const localTask = ref(cloneTask())
 const dialogTitle = computed(() => (localTask.value.id ? '编辑刷流任务' : '新建刷流任务'))
 const siteName = computed(() => props.sites.find(item => item.value === Number(localTask.value.site_id))?.title || '未选择')
 const scheduleText = computed(() => localTask.value.cron || `每 ${localTask.value.brush_interval || 10} 分钟`)
+
+const globalFields = [
+  ['global_disksize', '新增容量上限（GB）'],
+  ['global_delete_size_range', '清理容量下限–上限（GB）'],
+  ['global_min_seed_hours', '普通做种目标（小时）'],
+  ['global_inactive_hours', '普通未活动时间（小时）'],
+  ['global_seed_ratio', '普通分享率'],
+  ['global_seed_size', '普通上传量（GB）'],
+  ['global_download_time', '下载超时（小时）'],
+  ['global_seed_avgspeed', '普通平均上传速度（KB/s）'],
+]
+const globalValue = key => props.globalSettings[key] ?? '未设置'
 
 // 每次打开弹窗都从服务端任务快照重新创建本地草稿。
 watch(
@@ -232,8 +246,21 @@ async function saveTask() {
                 <div class="editor-switches">
                   <VSwitch v-model="localTask.rss_support" label="使用 RSS" color="primary" hide-details inset />
                   <VSwitch v-model="localTask.except_subscribe" label="排除订阅" color="primary" hide-details inset />
-                  <VSwitch v-model="localTask.site_hr_active" label="全站 H&R" color="primary" hide-details inset />
                 </div>
+              </section>
+
+              <section class="editor-section">
+                <header class="editor-section__head">
+                  <div>
+                    <div class="text-subtitle-1 font-weight-medium">下载器判重</div>
+                    <div class="text-body-2 text-medium-emphasis">任一命中即跳过，仅检查本下载器，包含辅种。</div>
+                  </div>
+                </header>
+                <div class="editor-switches">
+                  <VSwitch v-model="localTask.dedupe_hash" label="跳过已有相同 Hash" color="primary" hide-details inset />
+                  <VSwitch v-model="localTask.dedupe_site_id" label="跳过已有同站点种子 ID" color="primary" hide-details inset />
+                </div>
+                <div class="text-body-2 text-medium-emphasis mt-3">添加前核实 Hash，站点 ID 从备注详情链接提取，查询失败则暂缓新增，不按标题判重。</div>
               </section>
 
               <section class="editor-section">
@@ -319,10 +346,28 @@ async function saveTask() {
                     </div>
                   </div>
                 </header>
-                <VBtnToggle v-model="localTask.proxy_delete" mandatory color="primary" divided>
+                <VBtnToggle class="delete-mode-buttons" v-model="localTask.proxy_delete" mandatory color="primary" divided>
                   <VBtn :value="false">{{ globalDynamicDelete ? '不参与托管' : '按条件删除' }}</VBtn>
                   <VBtn :value="true">{{ globalDynamicDelete ? '参与全局托管' : '动态删种' }}</VBtn>
                 </VBtnToggle>
+                <div class="mt-4 policy-preview">
+                  <div class="policy-preview__header d-flex align-center justify-space-between flex-wrap ga-2">
+                    <div class="text-subtitle-1 font-weight-medium">全局删除配置（只读）</div>
+                    <VBtn variant="text" size="small" prepend-icon="mdi-cog-outline" @click="emit('open-global')">打开全局配置</VBtn>
+                  </div>
+                  <VRow class="policy-preview__fields">
+                    <VCol v-for="[key, label] in globalFields" :key="key" cols="12" sm="6" md="4">
+                      <VTextField :model-value="globalValue(key)" :label="label" disabled density="compact" hide-details />
+                    </VCol>
+                    <VCol cols="12" sm="6">
+                      <TagInput :model-value="globalSettings.global_delete_except_tags || ''" label="永久排除标签" disabled density="compact" hide-details />
+                    </VCol>
+                    <VCol cols="12" sm="6">
+                      <VTextField :model-value="globalSettings.global_del_no_free ? '开启' : '关闭'" label="促销过期清理（未完成下载）" disabled density="compact" hide-details />
+                    </VCol>
+                  </VRow>
+                  <div class="text-body-2 text-medium-emphasis mt-3">同类条件满足任一项即可（或），共享文件的每个任务须分别达标（且），H&R 保护标签未解除时保留。</div>
+                </div>
                 <VRow v-if="localTask.proxy_delete && !globalDynamicDelete">
                   <VCol cols="12">
                     <VTextField
@@ -334,15 +379,15 @@ async function saveTask() {
                 </VRow>
               </section>
               <section class="editor-section">
-                <VAlert v-if="globalDynamicDelete" type="info" variant="tonal" class="mb-4">每项留空继承全局，填写后覆盖对应全局值。适用的清理条件满足任意一项即可，全局容量阈值、保护标签及关联辅种检查仍需满足。</VAlert>
+                <VAlert v-if="globalDynamicDelete" type="info" variant="tonal" class="mb-4">下方字段留空继承全局，填写则覆盖，参与托管后按全局容量清理。</VAlert>
 
                 <VTextField
                   v-model.number="localTask.min_seed_hours"
                   type="number"
                   min="0.01"
                   clearable
-                  label="本任务累计做种目标（小时）"
-                  hint="留空继承全局，填写后覆盖全局累计做种目标，与其他适用条件为或关系。"
+                  label="累计做种目标（小时）"
+                  hint="留空继承全局，与同类条件为或关系。"
                   persistent-hint
                 />
               </section>
@@ -350,15 +395,12 @@ async function saveTask() {
                 <header class="editor-section__head">
                   <div>
                     <div class="text-subtitle-1 font-weight-medium">触发条件</div>
-                    <div class="text-body-2 text-medium-emphasis">各项留空继承全局，设置则覆盖，满足任一适用条件即可。H&R 单独使用 H&R 时间或分享率。</div>
+                    <div class="text-body-2 text-medium-emphasis">已完成任务的做种时间、未活动和分享率等条件为或，保护标签、容量及共享文件检查为且。下载超时和促销过期仅针对未完成任务，H&R 标签由助手达标后解除。</div>
                   </div>
                 </header>
                 <VRow>
                   <VCol v-if="!globalDynamicDelete" cols="12" md="4">
                     <VTextField v-model.number="localTask.seed_time" type="number" min="0" clearable hint="留空继承全局，填写后覆盖" persistent-hint label="做种时间（小时）" />
-                  </VCol>
-                  <VCol cols="12" md="4">
-                    <VTextField v-model.number="localTask.hr_seed_time" type="number" min="0" clearable hint="留空继承全局，填写后覆盖" persistent-hint label="H&R 做种时间（小时）" />
                   </VCol>
                   <VCol cols="12" md="4">
                     <VTextField v-model.number="localTask.seed_ratio" type="number" min="0" clearable hint="留空继承全局，填写后覆盖" persistent-hint label="分享率" />
@@ -370,13 +412,13 @@ async function saveTask() {
                     <VTextField v-model.number="localTask.download_time" type="number" min="0" clearable hint="留空继承全局，填写后覆盖" persistent-hint label="下载超时（小时）" />
                   </VCol>
                   <VCol cols="12" md="4">
-                    <VTextField v-model.number="localTask.seed_inactivetime" type="number" min="0" clearable hint="留空继承全局，填写后覆盖" persistent-hint label="未活动时间（分钟）" />
+                    <VTextField v-model.number="localTask.seed_inactivetime" type="number" min="0" clearable hint="与同类条件为或，留空继承全局" persistent-hint label="未活动时间（分钟）" />
                   </VCol>
                   <VCol cols="12" md="4">
                     <VTextField v-model.number="localTask.seed_avgspeed" type="number" min="0" clearable hint="留空继承全局，填写后覆盖" persistent-hint label="平均上传速度（KB/s）" />
                   </VCol>
                   <VCol cols="12" md="8">
-                    <VTextField v-model="localTask.delete_except_tags" clearable label="删除排除标签" hint="留空继承全局，填写后覆盖，多个标签用逗号分隔" persistent-hint />
+                    <TagInput v-model="localTask.delete_except_tags" clearable label="删除排除标签（永久保护）" hint="留空继承全局，回车添加，逗号或换行分隔，命中任一标签即保留" persistent-hint />
                   </VCol>
                 </VRow>
                 <VSelect
@@ -486,7 +528,22 @@ async function saveTask() {
 .editor-switches {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px 24px;
+  gap: 16px 24px;
+  padding-block: 8px;
+}
+
+.delete-mode-buttons {
+  margin-block: 8px 16px;
+  align-self: flex-start;
+}
+
+.policy-preview__header {
+  padding-block: 8px;
+  margin-block-end: 20px;
+}
+
+.policy-preview__fields :deep(.v-field--disabled) {
+  background: rgba(var(--v-theme-on-surface), 0.05);
 }
 
 .brushflow-editor__summary {

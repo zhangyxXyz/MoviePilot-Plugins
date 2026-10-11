@@ -21,10 +21,10 @@ def test_invalid_task(patch):
         CleanupTask.model_validate(dict(name='测试', downloader='QB', site_ids=[3]) | patch)
 
 
-def test_hr_tag_cannot_be_removed():
-    """API 与界面都不能绕过内置保护标签。"""
+def test_hr_tag_can_be_removed_from_manual_protection():
+    """保护标签尊重显式配置，独立 H&R 判断不变。"""
     task = CleanupTask(name='测试', downloader='QB', site_ids=[3], protect_tags=[])
-    assert 'H&R' in task.protect_tags
+    assert task.protect_tags == []
 
 
 def test_ambiguous_tracker_mapping_rejected():

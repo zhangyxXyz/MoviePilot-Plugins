@@ -2,7 +2,29 @@
 
 import copy
 import pytest
-from app.plugins.torrentcleanup.configuration import reconcile_config
+from app.plugins.torrentcleanup.configuration import reconcile_config, save_task_in_place, reorder_tasks
+
+
+def test_edit_keeps_position_and_new_task_appends():
+    tasks = [{'id': 'a', 'name': 'A'}, {'id': 'b', 'name': 'B'}]
+    changed = save_task_in_place(tasks, {'id': 'a', 'name': '新版 A'})
+    assert [t['id'] for t in changed] == ['a', 'b']
+    assert changed[0]['name'] == '新版 A' and tasks[0]['name'] == 'A'
+    assert [t['id'] for t in save_task_in_place(changed, {'id': 'c'})] == ['a', 'b', 'c']
+
+
+@pytest.mark.parametrize('ids', [['a'], ['b', 'b'], ['a', 'b', 'c']])
+def test_reorder_rejects_stale_or_duplicate_list(ids):
+    with pytest.raises(ValueError):
+        reorder_tasks([{'id': 'a'}, {'id': 'b'}], ids)
+
+
+def test_reorder_preserves_plan_and_observations(existing):
+    old, plans, observations = existing
+    updated = {**old, 'tasks': reorder_tasks(old['tasks'], ['b', 'a'])}
+    new, kept, records = reconcile_config(old, updated, plans, observations)
+    assert [t['id'] for t in new['tasks']] == ['b', 'a']
+    assert kept == plans and records == observations and new['revision'] == old['revision']
 
 
 @pytest.fixture

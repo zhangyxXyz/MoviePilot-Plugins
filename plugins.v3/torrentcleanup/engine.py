@@ -22,6 +22,18 @@ class Engine:
     def assess(self, task, row, observations: dict, bindings: dict, force=False):
         """复核单个任务，保存连续观察的累计信息并输出可读证据。"""
         torrent = row.torrent
+        from .hr_labels import protection_tags
+        helper_labels = protection_tags()
+        protected = set(task.protect_tags)
+        # Only tasks opting into an assistant label follow its current/renamed labels.
+        if protected & helper_labels:
+            protected |= helper_labels
+        task = task.model_copy(update={'hr_local_conditions': False, 'error_protect_unknown_hr': False,
+                                       'protect_tags': sorted(protected)})
+        torrent = replace(torrent, hr=False)
+        import copy
+        row = copy.copy(row)
+        row.torrent = torrent
         evidence, records = {}, {}
         if (task.mode == "invalid" or task.mode == 'conditions' and task.verify_invalid) and torrent.site_ids and torrent.site_ids.issubset(set(task.site_ids)):
             for site_id in torrent.site_ids:
@@ -173,7 +185,7 @@ class Engine:
                     if row.path != item.get("path") or row.torrent.size != item.get("size"):
                         reason = "下载目录或任务体积已变化，请重新预览"
                     if not decision.eligible or reason:
-                        result["reason"] = reason or "；".join(decision.reasons)
+                        result["reason"] = reason or "，".join(decision.reasons)
                     elif handled >= task.max_count or handled_bytes + row.torrent.size > task.max_gb * 1024**3:
                         result["reason"] = "达到本轮数量或体积上限"
                     elif task.action in {"mark", "pause"} and self.gateway.confirm(row.torrent, task.action, []):

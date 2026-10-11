@@ -26,6 +26,8 @@ const taskDefaults = {
   min_seed_hours: null,
   seed_time: null,
   hr_seed_time: null,
+  hr_seed_ratio: null,
+  hr_ratio_basis: 'client',
   seed_ratio: null,
   seed_size: null,
   download_time: null,
@@ -37,6 +39,8 @@ const taskDefaults = {
   auto_archive_days: null,
   save_path: null,
   delete_except_tags: null,
+  dedupe_hash: true,
+  dedupe_site_id: true,
   except_subscribe: true,
   proxy_delete: false,
   del_no_free: null,
@@ -72,6 +76,7 @@ function normalizeTask(task) {
     'min_seed_hours',
     'seed_time',
     'hr_seed_time',
+    'hr_seed_ratio',
     'seed_ratio',
     'seed_size',
     'download_time',
@@ -96,7 +101,7 @@ function normalizeTask(task) {
   ];
   nullableNumbers.forEach(key => {
     const value = result[key] === '' || result[key] === null ? null : Number(result[key]);
-    result[key] = value === 0 ? null : value;
+    result[key] = value === 0 && key !== 'hr_seed_ratio' ? null : value;
   });
   optionalText.forEach(key => {
     result[key] = String(result[key] || '').trim() || null;
@@ -186,7 +191,7 @@ function torrentStateLabel(item) {
 /** Task values replace corresponding global fields; blanks inherit. */
 function effectiveDeleteSettings(settings = {}, task = {}) {
   const result = { ...settings };
-  for (const key of ['seed_ratio', 'seed_size', 'download_time', 'seed_avgspeed', 'hr_seed_time', 'del_no_free', 'delete_except_tags']) {
+  for (const key of ['seed_ratio', 'seed_size', 'download_time', 'seed_avgspeed', 'hr_seed_time', 'hr_seed_ratio', 'hr_ratio_basis', 'del_no_free', 'delete_except_tags']) {
     if (task[key] !== null && task[key] !== undefined && task[key] !== '') result[`global_${key}`] = task[key];
   }
   result.global_min_seed_hours = task.min_seed_hours ?? task.seed_time ?? settings.global_min_seed_hours;
@@ -207,7 +212,8 @@ function globalDeleteRules(settings = {}, task = {}) {
   if (Number(settings.global_seed_avgspeed) > 0) rules.push(`平均上传速度低于 ${settings.global_seed_avgspeed} KB/s`);
   if (settings.global_del_no_free) rules.push('促销过期且下载未完成');
   let text = rules.join(' 或 ') || '未配置普通种子条件';
-  if (Number(settings.global_hr_seed_time) > 0) text += `。H&R 种子单独判断，累计做种 ${settings.global_hr_seed_time} 小时或达到分享率目标`;
+  text = `触发条件：${text}。保护标签、容量和共享文件检查须同时通过，H&R 标签由助手维护`;
+  text += '。共享文件的每个关联任务均须分别达标（且关系），不合并时间或上传量，任意任务未达标或受保护则整组保留';
   return text
 }
 
@@ -226,8 +232,18 @@ function globalDeleteSummary(settings = {}, task = {}) {
   if (settings.global_del_no_free) rules.push('促销过期');
   let summary = rules.slice(0, 2).join('或');
   if (rules.length > 2) summary += `等${rules.length}项`;
-  if (!summary) summary = Number(settings.global_hr_seed_time) > 0 ? `H&R ${duration(settings.global_hr_seed_time)}` : '按容量清理';
+  if (!summary) summary = '按容量清理';
   return `全局托管 · ${summary}`
+}
+
+/** 拖动插入目标位置；筛选时仅重排可见任务，隐藏任务保持原位。 */
+function orderedIds(tasks, from, to, visible = tasks) {
+  const ids = visible.map(t => t.id), a = ids.indexOf(from), b = ids.indexOf(to);
+  if (a < 0 || b < 0 || a === b) return tasks.map(t => t.id)
+  ids.splice(b, 0, ids.splice(a, 1)[0]);
+  const selected = new Set(ids);
+  let index = 0;
+  return tasks.map(t => selected.has(t.id) ? ids[index++] : t.id)
 }
 
 const _export_sfc = (sfc, props) => {
@@ -238,4 +254,4 @@ const _export_sfc = (sfc, props) => {
   return target;
 };
 
-export { _export_sfc as _, globalDeleteSummary as a, formatDateTime as b, cloneTask as c, formatDuration as d, torrentProgress as e, formatBytes as f, globalDeleteRules as g, torrentStateLabel as h, normalizeSettings as i, normalizeTask as n, taskStateMeta as t, unwrapResponse as u };
+export { _export_sfc as _, globalDeleteSummary as a, formatDateTime as b, cloneTask as c, formatDuration as d, torrentProgress as e, formatBytes as f, globalDeleteRules as g, torrentStateLabel as h, normalizeSettings as i, normalizeTask as n, orderedIds as o, taskStateMeta as t, unwrapResponse as u };

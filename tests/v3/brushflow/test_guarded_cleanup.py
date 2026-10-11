@@ -22,6 +22,14 @@ def file(path, size=100 * GIB, valid=True):
 def _plan(ts, files, **kwargs):
     return guard.build_plan(ts, files, 168, **kwargs)
 
+
+
+
+def test_manual_keep_tag_cannot_be_ignored_by_hr_bridge():
+    rows = [torrent('a', tags='刷流,H&R,勿删')]
+    decisions = {'a': {'managed': True, 'allow': True, 'owned_tags': ['H&R', '勿删']}}
+    assert not _plan(rows, {'a': [file('/a')]}, protected_tags={'H&R', '勿删'}, hr_decisions=decisions)['groups']
+
 def test_each_shared_seed_must_meet_its_own_target():
     ts = [torrent('a', 250), torrent('b', 300, '辅种')]
     fs = {'a': [file('/shared')], 'b': [file('/shared')]}
@@ -181,15 +189,6 @@ def test_expired_promotion_needs_enabled_rule_known_expiry_and_incomplete_downlo
         assert bool(plan['groups']) == expected
     assert not _plan([t], {'a': [f]}, promotion_expiries={'a': 9000}, now=10000)['groups']
 
-def test_hr_uses_own_time_or_ratio_and_does_not_use_idle():
-    t = torrent('a', 200)
-    t.update(last_activity=1, upspeed=0, dlspeed=0, ratio=0)
-    fs = {'a': [file('/a')]}
-    assert not _plan([t], fs, inactive_hours=48, hr_hashes=['a'], now=2000000000)['groups']
-    assert _plan([t], fs, hr_hashes=['a'], policy={'hr_seed_time': 200})['groups']
-    t['ratio'] = 2
-    assert _plan([t], fs, hr_hashes=['a'], policy={'hr_seed_time': 300, 'seed_ratio': 2})['groups']
-    assert not _plan([t], fs, hr_hashes=['a'], policy={'seed_ratio': 2}, protected_hashes=['a'])['groups']
 
 def test_new_conditions_do_not_bypass_shared_group_eligibility():
     a, b = (torrent('a', 1), torrent('b', 1, '辅种'))
@@ -317,7 +316,7 @@ def run_cleanup():
         service = SimpleNamespace(instance=SimpleNamespace(qbc=qb))
         helper = SimpleNamespace(get_service=lambda **kwargs: service)
         modules = {'app.sdk.logging': SimpleNamespace(logger=MagicMock()), 'app.sdk.services': SimpleNamespace(DownloaderHelper=lambda: helper)}
-        with patch.dict(sys.modules, modules), patch.object(guard.time, 'sleep'):
+        with patch.dict(sys.modules, modules), patch.object(guard.time, 'sleep'), patch.object(guard, 'configured_hr_tags', return_value={'H&R','H&R待核验'}):
             return guard.execute(plugin)
     return run_cleanup
 
@@ -390,3 +389,44 @@ def test_snapshot_rejects_path_traversal():
     qb.files['a'][0]['name'] = '../a'
     with pytest.raises(ValueError):
         guard.snapshot(qb)
+
+
+
+
+
+
+def test_configured_affiliate_tag_protects_entire_shared_group():
+    rows = [torrent('a'), torrent('b', tags='我的辅种')]
+    files = {'a': [file('/shared')], 'b': [file('/shared')]}
+    assert not _plan(rows, files, protected_tags={'我的辅种'})['groups']
+    assert _plan(rows, files, protected_tags=set())['groups']
+
+
+
+
+
+def test_hr_affiliate_uses_global_and_each_shared_owner_passes_separately():
+    rows=[torrent('a',hours=200),torrent('b',hours=100,tags='辅种')]
+    fs={'a':[file('/shared')], 'b':[file('/shared')]}
+    kwargs=dict(hr_tags={'辅种'},policy={'hr_seed_time':168},task_policies={'a':[{'min_seed_hours':168,'inactive_hours':0,'protected_tags':set()}]})
+    assert not _plan(rows,fs,**kwargs)['groups']
+    rows[1]['seeding_time']=168*3600
+    assert _plan(rows,fs,**kwargs)['groups']
+    rows[1]['tags']='辅种,勿删'
+    assert not _plan(rows,fs,protected_tags={'勿删'},**kwargs)['groups']
+
+
+
+
+
+@pytest.mark.parametrize('label',['H&R','H&R待核验','我的HR'])
+def test_helper_labels_block_even_with_task_override(label):
+    row=torrent('a',hours=999,tags='刷流,'+label)
+    kwargs=dict(always_protected_tags={label},task_policies={'a':[{'min_seed_hours':1,'inactive_hours':0,'protected_tags':set()}]})
+    assert not _plan([row],{'a':[file('/a')]},**kwargs)['groups']
+    row['tags']='刷流,辅种'
+    assert _plan([row],{'a':[file('/a')]},**kwargs)['groups']
+
+def test_legacy_hr_decision_cannot_strip_present_protection():
+    row=torrent('a',hours=999,tags='刷流,H&R')
+    assert not _plan([row],{'a':[file('/a')]},always_protected_tags={'H&R'},hr_decisions={'a':{'allow':True,'managed':True,'owned_tags':['H&R']}})['groups']

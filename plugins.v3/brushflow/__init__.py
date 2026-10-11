@@ -4,6 +4,7 @@ import re
 import threading
 import time
 import uuid
+from functools import wraps
 from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -36,7 +37,18 @@ from app.schemas.types import EventType
 from app.sdk.network import RequestUtils
 from app.sdk.utilities import StringUtils
 
-from .models import BrushFlowSettingsPayload, BrushTaskPayload, BrushTaskStatePayload
+from .dedupe import DuplicateTorrent, IdentityUnavailable, content_hashes, detail_keys, inventory
+
+from .models import BrushFlowSettingsPayload, BrushTaskPayload, BrushTaskStatePayload, BrushTaskOrderPayload, reorder_tasks
+
+
+def config_serialized(method):
+    """排序和编辑共用配置锁，避免并发保存覆盖任务。"""
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._config_lock:
+            return method(self, *args, **kwargs)
+    return wrapped
 
 
 TASK_CONFIG_FIELDS = (
@@ -65,6 +77,8 @@ TASK_CONFIG_FIELDS = (
     "min_seed_hours",
     "seed_time",
     "hr_seed_time",
+    "hr_seed_ratio",
+    "hr_ratio_basis",
     "seed_ratio",
     "seed_size",
     "download_time",
@@ -76,6 +90,8 @@ TASK_CONFIG_FIELDS = (
     "auto_archive_days",
     "save_path",
     "delete_except_tags",
+    "dedupe_hash",
+    "dedupe_site_id",
     "except_subscribe",
     "proxy_delete",
     "del_no_free",
@@ -98,6 +114,8 @@ LEGACY_SITE_OVERRIDE_FIELDS = {
     "min_seed_hours",
     "seed_time",
     "hr_seed_time",
+    "hr_seed_ratio",
+    "hr_ratio_basis",
     "seed_ratio",
     "seed_size",
     "download_time",
@@ -128,6 +146,8 @@ GLOBAL_LIMIT_FIELDS = (
 )
 
 GLOBAL_DYNAMIC_DELETE_FIELDS = (
+    "global_hr_tags",
+    "global_hr_guard_enabled",
     "global_del_no_free",
     "global_delete_except_tags",
     "global_proxy_delete",
@@ -144,6 +164,8 @@ class BrushTaskConfig:
         """读取并标准化一项刷流任务配置"""
         self.id = str(config.get("id") or uuid.uuid4().hex)
         self.name = str(config.get("name") or "刷流任务").strip()
+        self.dedupe_hash = bool(config.get("dedupe_hash", True))
+        self.dedupe_site_id = bool(config.get("dedupe_site_id", True))
         self.enabled = bool(config.get("enabled", True))
         self.notify = bool(config.get("notify", True))
         self.site_id = int(config.get("site_id") or 0)
@@ -169,6 +191,8 @@ class BrushTaskConfig:
         self.min_seed_hours = self._parse_number(config.get("min_seed_hours"))
         self.seed_time = self._parse_number(config.get("seed_time"))
         self.hr_seed_time = self._parse_number(config.get("hr_seed_time"))
+        self.hr_seed_ratio = self._parse_number(config.get("hr_seed_ratio"))
+        self.hr_ratio_basis = config.get("hr_ratio_basis") or "client"
         self.seed_ratio = self._parse_number(config.get("seed_ratio"))
         self.seed_size = self._parse_number(config.get("seed_size"))
         self.download_time = self._parse_number(config.get("download_time"))
@@ -231,8 +255,8 @@ class BrushFlow(_PluginBase):
     plugin_name = "站点刷流"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush-flow.png"
-    plugin_version = "6.2.1"
-    plugin_author = "seiun,jxxghp,InfinityPacer,Seed680"
+    plugin_version = "6.2.8"
+    plugin_author = "seiun, jxxghp,InfinityPacer,Seed680"
     author_url = "https://github.com/zhangyxXyz/MoviePilot-Plugins"
     plugin_config_prefix = "brushflow_"
     plugin_order = 21
@@ -246,6 +270,7 @@ class BrushFlow(_PluginBase):
     def init_plugin(self, config: dict = None) -> None:
         """初始化全局开关、任务配置、运行锁和历史数据迁移"""
         raw_config = config or {}
+        self._config_lock = threading.RLock()
         self._task_context = threading.local()
         self._task_locks: Dict[str, threading.Lock] = {}
         self._brush_lock = threading.Lock()
@@ -269,6 +294,8 @@ class BrushFlow(_PluginBase):
         )
         self._global_del_no_free = bool(raw_config.get("global_del_no_free", False))
         self._global_delete_except_tags = raw_config.get("global_delete_except_tags", "MOVIEPILOT,H&R")
+        self._global_hr_guard_enabled = bool(raw_config.get('global_hr_guard_enabled', False))
+        self._global_hr_tags = str(raw_config.get('global_hr_tags') or '')
         legacy_delete_range = raw_config.get("delete_size_range") if legacy_config else None
         self._global_proxy_delete, self._global_delete_size_range = self._validate_global_dynamic_delete_config(
             global_proxy_delete,
@@ -343,6 +370,13 @@ class BrushFlow(_PluginBase):
     def get_api(self) -> List[Dict[str, Any]]:
         """注册 Vue 工作台使用的刷流任务 API"""
         return [
+            {
+                "path": "/tasks/order",
+                "endpoint": self.reorder_task_list,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "调整刷流任务展示顺序",
+            },
             {
                 "path": "/status",
                 "endpoint": self.get_status,
@@ -522,6 +556,7 @@ class BrushFlow(_PluginBase):
         """返回全局设置、任务摘要和前端可选项"""
         return schemas.Response(success=True, data=self._build_status_data())
 
+    @config_serialized
     def update_settings(self, payload: BrushFlowSettingsPayload) -> schemas.Response:
         """更新插件全局开关并刷新宿主任务调度"""
         global_dynamic_delete_was_enabled = self._global_dynamic_delete_enabled()
@@ -540,6 +575,23 @@ class BrushFlow(_PluginBase):
         self._refresh_scheduler()
         return schemas.Response(success=True, data=self._build_status_data())
 
+    @config_serialized
+    def reorder_task_list(self, payload: BrushTaskOrderPayload) -> schemas.Response:
+        """只保存展示顺序，不重建调度、不修改任务或运行记录。"""
+        try:
+            ordered = reorder_tasks(self._task_configs, payload.ids)
+        except ValueError as err:
+            return schemas.Response(success=False, message=str(err))
+        previous = self._task_configs
+        self._task_configs = ordered
+        try:
+            self._save_config()
+        except Exception:
+            self._task_configs = previous
+            raise
+        return schemas.Response(success=True)
+
+    @config_serialized
     def create_task(self, payload: BrushTaskPayload) -> schemas.Response:
         """创建一个站点与下载器均独立的刷流任务"""
         task_data = payload.model_dump()
@@ -569,6 +621,7 @@ class BrushFlow(_PluginBase):
             data=self._build_task_detail(task_id, state=state, page=page, page_size=page_size),
         )
 
+    @config_serialized
     def update_task(self, task_id: str, payload: BrushTaskPayload) -> schemas.Response:
         """更新任务配置并保持原任务 ID 与历史数据关联"""
         if task_id not in self._task_configs:
@@ -585,6 +638,7 @@ class BrushFlow(_PluginBase):
         self._refresh_scheduler()
         return schemas.Response(success=True, data=self._build_task_detail(task_id))
 
+    @config_serialized
     def delete_task(self, task_id: str) -> schemas.Response:
         """删除没有活跃种子的任务及其独立历史数据"""
         task = self._task_configs.get(task_id)
@@ -610,6 +664,7 @@ class BrushFlow(_PluginBase):
             logger.warning(f"提交刷流任务标签清理失败：{str(err)}")
         return schemas.Response(success=True, data=self._build_status_data())
 
+    @config_serialized
     def update_task_state(self, task_id: str, payload: BrushTaskStatePayload) -> schemas.Response:
         """启用或暂停单个任务并更新对应宿主调度"""
         task = self._task_configs.get(task_id)
@@ -670,13 +725,15 @@ class BrushFlow(_PluginBase):
 
     def _guarded_delete_enabled(self) -> bool:
         """有保种策略时统一交由共享文件保护执行器删除，避免普通删种绕过保护。"""
-        return bool(getattr(self, "_global_min_seed_hours", None)
+        return bool(getattr(self, "_global_hr_tags", "")
+                    or getattr(self, "_global_hr_guard_enabled", False)
+                    or getattr(self, "_global_min_seed_hours", None)
                     or getattr(self, "_global_inactive_hours", None)
                     or getattr(self, "_global_del_no_free", False)
                     or any(getattr(self, f"_{field}", None) for field in ('global_seed_ratio', 'global_seed_size', 'global_download_time', 'global_seed_avgspeed', 'global_hr_seed_time'))
                     or any(getattr(t, "min_seed_hours", None) for t in self._task_configs.values())
                     or (self._global_dynamic_delete_enabled() and any(
-                        any(getattr(t, field, None) for field in ("min_seed_hours", "seed_time", "seed_ratio", "seed_size", "download_time", "seed_avgspeed", "hr_seed_time", "seed_inactivetime", "del_no_free"))
+                        any(getattr(t, field, None) for field in ("min_seed_hours", "seed_time", "seed_ratio", "seed_size", "download_time", "seed_avgspeed", "hr_seed_time", "hr_seed_ratio", "seed_inactivetime", "del_no_free"))
                         for t in self._task_configs.values())))
 
     def _global_dynamic_delete_enabled(self) -> bool:
@@ -1403,6 +1460,12 @@ class BrushFlow(_PluginBase):
     ) -> None:
         """获取当前任务站点候选并逐项执行保留的选种规则"""
         task = self._get_task_config()
+        try:
+            _, existing_details = inventory(self.service_info, include_details=task.dedupe_site_id) if (task.dedupe_hash or task.dedupe_site_id) else (set(), set())
+        except IdentityUnavailable as err:
+            report["reason_counts"][str(err)] += 1
+            report["result"] = "precondition_blocked"
+            return
         logger.info(f"刷流任务 [{task.name}] 开始获取站点 {site.name} 的新种子")
         torrents = TorrentsChain().rss(domain=site.domain) if task.rss_support else TorrentsChain().browse(domain=site.domain)
         if not torrents:
@@ -1436,7 +1499,18 @@ class BrushFlow(_PluginBase):
             if not passed:
                 report["reason_counts"][reason] += 1
                 continue
-            hash_string = self.__download(torrent)
+            if task.dedupe_site_id and detail_keys(torrent.page_url) & existing_details:
+                report["reason_counts"]["下载器已有同站点种子 ID"] += 1
+                continue
+            try:
+                hash_string = self.__download(torrent)
+            except DuplicateTorrent as err:
+                report["reason_counts"][str(err)] += 1
+                continue
+            except IdentityUnavailable as err:
+                report["reason_counts"][str(err)] += 1
+                report["result"] = "precondition_blocked"
+                break
             if not hash_string:
                 report["reason_counts"]["下载器添加失败"] += 1
                 continue
@@ -1460,11 +1534,18 @@ class BrushFlow(_PluginBase):
             logger.info(f"刷流任务 [{task.name}] 新增种子：{torrent.title}|{torrent.description}")
             self.__send_add_message(torrent)
         report["filtered_count"] = max(report["candidate_count"] - report["added_count"], 0)
-        report["result"] = "completed"
+        if report["result"] != "precondition_blocked":
+            report["result"] = "completed"
 
     @staticmethod
     def _torrent_to_task_record(torrent: TorrentInfo, site: Any, task: BrushTaskConfig) -> dict:
         """把站点候选种子转换为可持久化的任务记录"""
+        try:
+            indexer = SitesHelper().get_indexer(site.domain) or {}
+            fields = (indexer.get('browse') or {}).get('fields') or (indexer.get('torrents') or {}).get('fields') or {}
+            hr_verified = not task.rss_support and bool((fields.get('hr') or {}).get('selector'))
+        except Exception:
+            hr_verified = False
         return {
             "task_id": task.id,
             "task_name": task.name,
@@ -1480,6 +1561,7 @@ class BrushFlow(_PluginBase):
             "uploadvolumefactor": torrent.uploadvolumefactor,
             "downloadvolumefactor": torrent.downloadvolumefactor,
             "hit_and_run": torrent.hit_and_run or task.site_hr_active,
+            "hr_verified": hr_verified or task.site_hr_active,
             "volume_factor": torrent.volume_factor,
             "freedate_diff": torrent.freedate_diff,
             "ratio": 0,
@@ -1822,13 +1904,6 @@ class BrushFlow(_PluginBase):
         task = self._get_task_config()
         if not task:
             return False, "任务配置不存在"
-        hit_and_run = bool(torrent_task.get("hit_and_run"))
-        if hit_and_run and (task.hr_seed_time or task.seed_ratio):
-            if task.hr_seed_time and torrent_info.get("seeding_time", 0) >= float(task.hr_seed_time) * 3600:
-                return True, f"H&R 做种时间达到 {task.hr_seed_time} 小时"
-            if task.seed_ratio and torrent_info.get("ratio", 0) >= float(task.seed_ratio):
-                return True, f"H&R 分享率达到 {task.seed_ratio}"
-            return False, "H&R 种子尚未满足删除条件"
         promotion_expired, promotion_reason = self.__promotion_expired(torrent_info, torrent_task)
         if promotion_expired:
             return True, promotion_reason
@@ -1898,13 +1973,13 @@ class BrushFlow(_PluginBase):
         torrents: List[Any],
         torrent_tasks: Dict[str, dict],
     ) -> List[str]:
-        """动态删种前优先清理促销过期或下载超时的非 H&R 种子"""
+        """动态删种前优先清理促销过期或下载超时且无保护标签的种子"""
         task = self._get_task_config()
         delete_hashes: List[str] = []
         for torrent in torrents:
             torrent_hash = self.__get_hash(torrent)
             torrent_task = torrent_tasks.get(torrent_hash)
-            if not task or not torrent_task or torrent_task.get("hit_and_run"):
+            if not task or not torrent_task:
                 continue
             torrent_info = self.__get_torrent_info(torrent)
             expired, reason = self.__promotion_expired(torrent_info, torrent_task)
@@ -2010,7 +2085,6 @@ class BrushFlow(_PluginBase):
                 for candidate in candidates
                 if candidate.get("proxy_delete")
                 and candidate.get("completed")
-                and not candidate.get("hit_and_run")
             ),
             key=lambda item: item.get("seeding_time", 0),
             reverse=True,
@@ -2104,17 +2178,16 @@ class BrushFlow(_PluginBase):
                     torrent_key = (task.downloader, torrent_hash)
                     torrent_info = self.__get_torrent_info(torrent)
                     pre_delete_reason = ""
-                    if not torrent_task.get("hit_and_run"):
-                        expired, expired_reason = self.__promotion_expired(torrent_info, torrent_task)
-                        timed_out = bool(
-                            task.download_time
-                            and torrent_info.get("downloaded", 0) < torrent_info.get("total_size", 0)
-                            and torrent_info.get("dltime", 0) >= float(task.download_time) * 3600
-                        )
-                        if expired:
-                            pre_delete_reason = expired_reason
-                        elif timed_out:
-                            pre_delete_reason = f"下载耗时达到 {task.download_time} 小时"
+                    expired, expired_reason = self.__promotion_expired(torrent_info, torrent_task)
+                    timed_out = bool(
+                        task.download_time
+                        and torrent_info.get("downloaded", 0) < torrent_info.get("total_size", 0)
+                        and torrent_info.get("dltime", 0) >= float(task.download_time) * 3600
+                    )
+                    if expired:
+                        pre_delete_reason = expired_reason
+                    elif timed_out:
+                        pre_delete_reason = f"下载耗时达到 {task.download_time} 小时"
                     should_delete, conditional_reason = self.__evaluate_conditions_for_delete(
                         torrent_info,
                         torrent_task,
@@ -2367,8 +2440,6 @@ class BrushFlow(_PluginBase):
             candidates = []
             for torrent in completed:
                 torrent_hash = self.__get_hash(torrent)
-                if torrent_tasks.get(torrent_hash, {}).get("hit_and_run"):
-                    continue
                 info = torrent_info_map.get(torrent_hash) or self.__get_torrent_info(torrent)
                 candidates.append((torrent_hash, info))
             candidates.sort(key=lambda item: item[1].get("seeding_time", 0), reverse=True)
@@ -2538,6 +2609,19 @@ class BrushFlow(_PluginBase):
         service = self.service_info
         if not downloader or not service:
             return None
+        if task.dedupe_hash:
+            if isinstance(torrent_content, str) and not torrent_content.startswith("magnet:"):
+                try:
+                    response = RequestUtils(cookies=cookies, proxies=proxies, ua=torrent.site_ua).get_res(url=torrent_content)
+                    if response is None or not response.ok:
+                        raise ValueError("download failed")
+                    torrent_content = response.content
+                except Exception:
+                    raise IdentityUnavailable("获取种子内容失败，暂缓新增") from None
+            candidate_hashes = content_hashes(torrent_content)
+            current_hashes, _ = inventory(service)
+            if candidate_hashes & current_hashes:
+                raise DuplicateTorrent("下载器已有相同 Hash（含辅种任务）")
         downloader_helper = DownloaderHelper()
         if downloader_helper.is_downloader("qbittorrent", service=service):
             up_limit = up_speed * 1024 if up_speed else None
@@ -2758,9 +2842,8 @@ class BrushFlow(_PluginBase):
 
     def __filter_torrents_by_tag(self, torrents: List[Any], exclude_tag: Optional[str]) -> List[Any]:
         """过滤包含任一删除排除标签的种子"""
-        if not exclude_tag:
-            return torrents
-        excluded_tags = {item.strip() for item in exclude_tag.split(",") if item.strip()}
+        from .hr_labels import protection_tags
+        excluded_tags = protection_tags() | {item.strip() for item in (exclude_tag or '').split(',') if item.strip()}
         return [
             torrent for torrent in torrents
             if not excluded_tags.intersection(self.__get_label(torrent))

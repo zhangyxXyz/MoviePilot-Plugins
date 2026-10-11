@@ -5,6 +5,7 @@ import GlobalDeletePolicy from './GlobalDeletePolicy.vue'
 import PolicyText from './PolicyText.vue'
 import {
   cloneTask,
+  orderedIds,
   globalDeleteRules,
   globalDeleteSummary,
   torrentStateLabel,
@@ -29,6 +30,7 @@ const emit = defineEmits(['close', 'action'])
 const loading = ref(false)
 const taskLoading = ref(false)
 const saving = ref(false)
+const dragged = ref('')
 const error = ref('')
 const status = ref({
   enabled: false,
@@ -60,6 +62,8 @@ const settingsDraft = ref({
   global_hr_seed_time: null,
   global_del_no_free: false,
   global_delete_except_tags: "MOVIEPILOT,H&R",
+  global_hr_guard_enabled: false,
+  global_hr_tags: "",
   global_disksize: null,
   global_maxdlcount: null,
   global_maxupspeed: null,
@@ -123,6 +127,26 @@ function notify(text, color = 'success') {
   }
 }
 
+async function sortTasks(from, to) {
+  if (saving.value || !from || from === to) return
+  saving.value = true
+  try {
+    unwrapResponse(await props.api.post(`${pluginBase.value}/tasks/order`, { ids: orderedIds(tasks.value, from, to) }))
+    await loadStatus({ loadDetail: false })
+    notify('任务顺序已保存，编辑任务不会改变位置')
+  } catch (err) { error.value = err?.message || '保存任务顺序失败' }
+  finally { saving.value = false }
+}
+function moveTask(id, delta) {
+  const other = tasks.value[tasks.value.findIndex(t => t.id === id) + delta]
+  if (other) return sortTasks(id, other.id)
+}
+function startTaskDrag(event, id) {
+  dragged.value = id
+  event.dataTransfer?.setData('text/plain', id)
+  if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move'
+}
+
 // 从插件状态接口加载全局设置和任务摘要。
 async function loadStatus({ preserveSelection = true, loadDetail = true } = {}) {
   loading.value = true
@@ -142,6 +166,8 @@ async function loadStatus({ preserveSelection = true, loadDetail = true } = {}) 
       global_hr_seed_time: status.value.global_hr_seed_time ?? null,
       global_del_no_free: Boolean(status.value.global_del_no_free),
       global_delete_except_tags: status.value.global_delete_except_tags ?? "MOVIEPILOT,H&R",
+      global_hr_guard_enabled: status.value.global_hr_guard_enabled ?? false,
+      global_hr_tags: status.value.global_hr_tags ?? "",
       global_disksize: status.value.global_disksize ?? null,
       global_maxdlcount: status.value.global_maxdlcount ?? null,
       global_maxupspeed: status.value.global_maxupspeed ?? null,
@@ -201,6 +227,11 @@ function openCreateTask() {
 }
 
 // 打开当前任务的服务端配置快照。
+async function editTaskCard(id) {
+  await selectTask(id)
+  openEditTask()
+}
+
 function openEditTask() {
   if (!taskConfig.value.id) return
   editorTask.value = cloneTask(taskConfig.value)
@@ -329,7 +360,7 @@ const taskDeletePolicy = computed(() => {
   if (status.value.global_proxy_delete) {
     if (!taskConfig.value.proxy_delete) return '不参与全局托管'
     const [low, high] = String(status.value.global_delete_size_range || '').split('-')
-    return `容量达到 ${high || low || '未设置'} GB 时开始清理，降至 ${low || '未设置'} GB 停止。${globalRuleText.value}，满足任意一项适用条件即可参与清理。共用文件逐个检查，H&R 和保护标签优先。`
+    return `容量达到 ${high || low || '未设置'} GB 时开始清理，降至 ${low || '未设置'} GB 停止。${globalRuleText.value}。满足触发条件后仍须通过保护检查。`
   }
   if (status.value.guarded_delete_enabled) return '全局托管未开启，暂停自动删除'
   return taskConfig.value.proxy_delete ? `任务动态清理，${taskConfig.value.delete_size_range || '未设置阈值'} GB` : '普通模式，满足任一条件'
@@ -338,7 +369,7 @@ const taskDeletePolicy = computed(() => {
 // 根据配置生成当前种子的下一项处理条件摘要。
 function torrentPolicy(item) {
   if (item.deleted) return item.delete_reason || '已删除'
-  if (status.value.global_proxy_delete) return item.hit_and_run ? `${taskDeletePolicy.value}。H&R 使用独立时间或分享率条件，保护标签仍优先。` : taskDeletePolicy.value
+  if (status.value.global_proxy_delete) return taskDeletePolicy.value
   if (item.hit_and_run && taskConfig.value.hr_seed_time) return `H&R ${taskConfig.value.hr_seed_time} 小时`
   if (taskConfig.value.seed_time) return `${taskConfig.value.seed_time} 小时后检查`
   if (taskConfig.value.seed_ratio) return `分享率 ${taskConfig.value.seed_ratio}`
@@ -397,9 +428,6 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
         </div>
       </div>
       <div class="brushflow-page__actions">
-        <VChip v-if="status.summary.task_count" size="small" variant="tonal">
-          {{ status.summary.running_count ?? status.summary.enabled_count ?? 0 }} / {{ status.summary.task_count }} 运行
-        </VChip>
         <VBtn prepend-icon="mdi-delete-clock-outline" variant="tonal" @click="policyOpen = true">全局删除策略</VBtn>
         <VMenu v-model="settingsMenu" :close-on-content-click="false" location="bottom end">
           <template #activator="{ props: menuProps }">
@@ -488,35 +516,35 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
       </VSelect>
 
       <div class="brushflow-layout">
-        <VSheet tag="aside" class="brushflow-task-rail app-surface-static">
-          <div class="brushflow-task-rail__head">
-            <span class="text-subtitle-2">刷流任务</span>
-            <VChip size="x-small" variant="tonal">{{ tasks.length }}</VChip>
-          </div>
+        <VSheet tag="aside" class="brushflow-task-rail">
           <div class="brushflow-task-list">
-            <button
-              v-for="task in tasks"
+            <div
+              v-for="(task, index) in tasks"
               :key="task.id"
-              type="button"
+              role="button" tabindex="0" :draggable="!saving"
+              @dragstart="startTaskDrag($event, task.id)" @dragend="dragged = ''"
+              @dragover.prevent @drop.prevent="sortTasks(dragged, task.id); dragged = ''"
+              @keydown.enter.self="selectTask(task.id)" @keydown.space.self.prevent="selectTask(task.id)"
               class="brushflow-task-item"
               :class="{ 'brushflow-task-item--selected': task.id === selectedTaskId }"
               :aria-pressed="task.id === selectedTaskId"
               @click="selectTask(task.id)"
             >
               <span class="brushflow-task-item__title">
-                <strong>{{ task.name }}</strong>
-                <span class="brushflow-status-dot" :class="`brushflow-status-dot--${taskStateMeta(task.state).color}`" />
+                <VIcon icon="mdi-drag-vertical" size="18" class="task-drag-handle" /><strong :title="task.name">{{ task.name }}</strong>
+                <VChip size="x-small" :color="taskStateMeta(task.state).color">{{ taskStateMeta(task.state).text }}</VChip>
               </span>
-              <span>{{ task.site_name }} · {{ task.downloader }}</span>
-              <span class="brushflow-task-item__meta">
-                <span>{{ task.statistic.active || 0 }} 个种子</span>
-                <span>{{ task.next_run_at ? formatDateTime(task.next_run_at) : '暂无计划' }}</span>
-              </span>
-            </button>
+              <div class="rail-tags"><span class="rail-pill rail-accent" :title="task.site_name">{{ task.site_name }}</span><span class="rail-pill rail-neutral" :title="task.downloader">{{ task.downloader }}</span></div>
+              <div class="rail-details"><div class="rail-row"><span class="rail-pill rail-label">在管种子</span><span class="rail-pill">{{ task.statistic.active || 0 }} 个</span></div><div class="rail-row"><span class="rail-pill rail-label">下次运行</span><span class="rail-pill" :title="task.next_run_at ? formatDateTime(task.next_run_at) : '暂无计划'">{{ task.next_run_at ? formatDateTime(task.next_run_at) : '暂无计划' }}</span></div></div>
+              <div class="task-card-actions">
+                <VBtn icon="mdi-arrow-up" size="x-small" variant="text" :aria-label="`上移 ${task.name}`" :disabled="saving || index === 0" @click.stop="moveTask(task.id, -1)" />
+                <VBtn icon="mdi-arrow-down" size="x-small" variant="text" :aria-label="`下移 ${task.name}`" :disabled="saving || index === tasks.length - 1" @click.stop="moveTask(task.id, 1)" />
+                <VBtn icon="mdi-pencil" size="x-small" variant="text" aria-label="编辑任务" @click.stop="editTaskCard(task.id)" />
+              </div>
+            </div>
           </div>
-          <VBtn class="brushflow-create-task" block variant="tonal" prepend-icon="mdi-plus" @click="openCreateTask">
-            新建任务
-          </VBtn>
+
+          <VBtn block variant="tonal" color="primary" prepend-icon="mdi-plus" class="mt-3" @click="openCreateTask">新建任务</VBtn>
         </VSheet>
 
         <main v-if="selectedTask" class="brushflow-workspace">
@@ -864,6 +892,8 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
       :sites="status.options.sites"
       :downloaders="status.options.downloaders"
       :global-dynamic-delete="Boolean(status.global_proxy_delete)"
+      :global-settings="status"
+      @open-global="policyOpen = true"
       :saving="saving"
       @save="saveTask"
     />
@@ -894,6 +924,9 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
 </template>
 
 <style scoped>
+.task-card-actions { display:flex; justify-content:flex-end; }
+.task-drag-handle { cursor:grab; opacity:.6; }
+.brushflow-task-item__title strong { flex:1; }
 .brushflow-page {
   display: flex;
   flex-direction: column;
@@ -1001,23 +1034,17 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
 
 .brushflow-layout {
   display: grid;
-  grid-template-columns: minmax(13.5rem, 0.3fr) minmax(0, 1.7fr);
+  grid-template-columns: 280px minmax(0, 1fr);
   align-items: start;
-  gap: 18px;
+  gap: 24px;
   min-inline-size: 0;
 }
 
 .brushflow-task-rail {
-  position: sticky;
-  top: 76px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  max-block-size: calc(100dvh - 104px);
-  padding: 12px;
-  overflow-y: auto;
-  border: var(--app-surface-border);
-  border-radius: var(--app-surface-radius);
+  min-inline-size: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
 }
 
 .brushflow-task-rail__head {
@@ -1025,13 +1052,13 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding-inline: 4px;
+  padding: 0 0 12px;
 }
 
 .brushflow-task-list {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 12px;
 }
 
 .brushflow-create-task {
@@ -1044,11 +1071,11 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
   flex-direction: column;
   gap: 6px;
   inline-size: 100%;
-  padding: 11px 12px;
-  border: 1px solid transparent;
-  border-radius: var(--app-control-radius);
+  padding: 14px;
+  border: 1px solid rgba(var(--v-theme-on-surface), .12);
+  border-radius: 12px;
   color: rgb(var(--v-theme-on-surface));
-  background: transparent;
+  background: rgb(var(--v-theme-surface));
   font: inherit;
   text-align: start;
   cursor: pointer;
@@ -1064,8 +1091,8 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
 }
 
 .brushflow-task-item--selected {
-  border-color: rgba(var(--v-theme-primary), 0.28);
-  background: rgba(var(--v-theme-primary), 0.1);
+  border-color: rgb(var(--v-theme-primary));
+  background: rgba(var(--v-theme-primary), 0.06);
 }
 
 .brushflow-task-item__title,
@@ -1590,4 +1617,6 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
     flex-direction: column;
   }
 }
+.rail-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.rail-details{display:grid;gap:4px;margin-top:6px}.rail-row{display:grid;grid-template-columns:64px minmax(0,1fr);align-items:center;gap:6px;min-height:24px}.rail-pill{display:inline-block;justify-self:start;max-width:100%;min-width:0;padding:2px 8px;border-radius:999px;background:rgba(var(--v-theme-primary),.09);border:1px solid rgba(var(--v-theme-primary),.12);color:rgb(var(--v-theme-on-surface));font-size:11px;line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-variant-numeric:tabular-nums}.rail-label,.rail-neutral{background:rgba(var(--v-theme-on-surface),.04);border-color:rgba(var(--v-theme-on-surface),.07);color:rgba(var(--v-theme-on-surface),.65)}.rail-accent{color:rgb(var(--v-theme-primary))}.rail-warn{color:rgb(var(--v-theme-warning));background:rgba(var(--v-theme-warning),.08);border-color:rgba(var(--v-theme-warning),.15)}
+.brushflow-task-item{gap:0}.brushflow-task-item__title strong{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.task-card-actions{margin-top:8px}
 </style>

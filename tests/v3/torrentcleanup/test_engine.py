@@ -95,7 +95,7 @@ def test_download_error_execution_rechecks_recovery(setup_engine, monkeypatch):
     assert report['items'][0]['status'] == 'skipped' and not gateway.commands
 
 
-@pytest.mark.parametrize('change', ['tag', 'path', 'size', 'hr'])
+@pytest.mark.parametrize('change', ['tag', 'path', 'size', 'pending_tag'])
 def test_fresh_changes_block_execution(setup_engine, change):
     """预览之后保护条件、文件范围变化会阻止写命令。"""
     engine, gateway, task, _ = setup_engine
@@ -103,7 +103,7 @@ def test_fresh_changes_block_execution(setup_engine, change):
     if change == 'path':
         gateway.row.path = '/new'
     else:
-        patch = {'tag': {'tags': frozenset({'H&R'})}, 'size': {'size': 2048}, 'hr': {'hr': True}}[change]
+        patch = {'tag': {'tags': frozenset({'H&R'})}, 'size': {'size': 2048}, 'pending_tag': {'tags': frozenset({'H&R待核验'})}}[change]
         gateway.row.torrent = replace(gateway.row.torrent, **patch)
     assert engine.execute(task, plan, 'r1')['items'][0]['status'] == 'skipped'
     assert not gateway.commands

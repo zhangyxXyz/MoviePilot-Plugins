@@ -1,4 +1,5 @@
 """按用户显式勾选的状态、关键词及保护条件进行筛选。"""
+import math
 from .policy import Decision
 
 
@@ -21,9 +22,24 @@ def assess_conditions(task, row, observations, evidence, records, now):
     if task.require_healthy and not t.healthy: reasons.append('本地状态异常或正在校验')
     if set(task.protect_tags).intersection(t.tags): reasons.append('命中保护标签')
     if not set(task.include_tags).issubset(t.tags): reasons.append('缺少必需标签')
-    if t.hr is True or task.error_protect_unknown_hr and t.hr is None: reasons.append('H&R 未满足或无法确认')
-    if task.filter_seed and (t.seed_seconds is None or t.seed_seconds < task.min_seed_hours*3600): reasons.append('累计做种时间不足或未知')
-    if task.filter_ratio and (t.ratio is None or t.ratio < task.min_ratio): reasons.append('分享率不足或未知')
+    local_hr = False
+    if task.hr_local_conditions:
+        identified = getattr(row, 'hr_identified', None)
+        local_hr = bool(set(task.hr_tags).intersection(t.tags) or identified is True
+                        or identified is None and task.error_protect_unknown_hr)
+        if local_hr:
+            seed, uploaded = t.seed_seconds, getattr(row, 'uploaded', None)
+            time_ok = task.hr_seed_hours > 0 and seed is not None and math.isfinite(seed) and seed >= task.hr_seed_hours * 3600
+            upload_ok = task.hr_upload_gb > 0 and uploaded is not None and math.isfinite(uploaded) and uploaded >= task.hr_upload_gb * 1024**3
+            if not t.completed:
+                reasons.append('H&R 分支要求下载完成')
+            if not (time_ok or upload_ok):
+                reasons.append('H&R 做种时间或上传量尚未达标')
+    elif t.hr is True or task.error_protect_unknown_hr and t.hr is None:
+        reasons.append('H&R 未满足或无法确认')
+    if not local_hr:
+        if task.filter_seed and (t.seed_seconds is None or t.seed_seconds < task.min_seed_hours*3600): reasons.append('累计做种时间不足或未知')
+        if task.filter_ratio and (t.ratio is None or t.ratio < task.min_ratio): reasons.append('分享率不足或未知')
     speed = getattr(row, 'download_speed', None)
     progress = getattr(row, 'progress', None)
     added = getattr(row, 'added_at', None)
@@ -61,3 +77,26 @@ def assess_conditions(task, row, observations, evidence, records, now):
     if t.size <= 0 and (task.action == 'deletefile' or task.completion == 'completed'):
         reasons.append('任务体积未知')
     return Decision(not reasons, tuple(reasons) if reasons else ('满足全部勾选条件',), task.action)
+
+
+def identify_hr(torrent, policies, record=None, event=None):
+    """识别属性，不检查 Tracker 健康或站点完成状态；本地门槛单独判断。"""
+    record, event = record or {}, event or {}
+    signals = dict(record.get('signals') or {})
+    if event.get('site_id') and event.get('signal') is not None:
+        signals[str(event['site_id'])] = event['signal']
+    if any(policies.get(s) and policies[s].hr_mode == 'managed' and policies[s].hr_detection == 'all' for s in torrent.site_ids):
+        return True
+    if any(signals.get(str(s)) is True for s in torrent.site_ids):
+        return True
+    if record.get('history_exempt'):
+        return False
+    if not torrent.sites_complete or not torrent.site_ids:
+        return None
+    for sid in torrent.site_ids:
+        policy = policies.get(sid)
+        if not policy or policy.hr_mode == 'unknown':
+            return None
+        if policy.hr_mode == 'managed' and signals.get(str(sid)) is not False:
+            return None
+    return False

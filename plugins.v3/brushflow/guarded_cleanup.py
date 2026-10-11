@@ -13,6 +13,11 @@ GIB = 1024 ** 3
 REVISION = "20261008.5"
 
 
+def configured_hr_tags():
+    from .hr_labels import protection_tags
+    return protection_tags()
+
+
 def tags(torrent):
     return {v.strip() for v in str(torrent.get("tags", "")).split(",") if v.strip()}
 
@@ -38,13 +43,6 @@ def match_rules(torrent, complete, required_hours, inactive_hours, now, policy,
     seed = optional_number(torrent.get("seeding_time"))
     ratio = optional_number(torrent.get("ratio"))
     ratio_target = policy.get("seed_ratio", 0)
-    if is_hr:
-        rules = []
-        if complete and policy.get("hr_seed_time", 0) and seed is not None and seed >= policy["hr_seed_time"] * 3600:
-            rules.append(f"H&R 累计做种达到 {policy['hr_seed_time']:g} 小时")
-        if complete and ratio_target and ratio is not None and ratio >= ratio_target:
-            rules.append(f"H&R 分享率达到 {ratio_target:g}")
-        return rules
     rules = []
     added = optional_number(torrent.get("added_on"))
     age = now - added if added is not None and 0 < added <= now else None
@@ -89,6 +87,8 @@ def resolve_task_policy(plugin, task):
     for key in POLICY_FIELDS[:-1]:
         policy[key] = number(policy[key] or 0)
     policy["del_no_free"] = bool(policy["del_no_free"])
+    policy['hr_seed_ratio'] = getattr(task, 'hr_seed_ratio', None)
+    policy['hr_ratio_basis'] = getattr(task, 'hr_ratio_basis', 'client')
     hours = getattr(task, "min_seed_hours", None)
     if hours is None:
         hours = getattr(task, "seed_time", None)
@@ -111,13 +111,14 @@ def policies_by_hash(plugin, downloader_name):
 
 
 def build_plan(rows, files, min_hours, protected_hashes=(), protected_tags=(),
-               required_tags=("刷流",), min_hours_by_hash=None, inactive_hours=0, now=None, policy=None, hr_hashes=(), promotion_expiries=None, task_policies=None):
+               required_tags=("刷流",), min_hours_by_hash=None, inactive_hours=0, now=None, policy=None, hr_hashes=(), promotion_expiries=None, task_policies=None, hr_decisions=None, hr_tags=(), always_protected_tags=()):
     """Pure planner. files maps hash to [{path, size, valid}], in canonical paths."""
     task_policies = task_policies or {}
     policy = dict(policy or {})
     for key in ("seed_ratio", "seed_size", "download_time", "seed_avgspeed", "hr_seed_time"):
         policy[key] = number(policy.get(key) or 0)
     hr_hashes = set(hr_hashes)
+    hr_tags = set(hr_tags)
     promotion_expiries = promotion_expiries or {}
     required_tags, protected_tags = set(required_tags), set(protected_tags)
     protected_hashes = set(protected_hashes)
@@ -168,9 +169,10 @@ def build_plan(rows, files, min_hours, protected_hashes=(), protected_tags=(),
         matched_rules = {}
         for h in hashes:
             t = by_hash[h]
+            effective_tags = tags(t)
             effective = task_policies.get(h) or [{**policy, "min_seed_hours": min_hours_by_hash.get(h, min_hours),
                                                      "inactive_hours": inactive_hours, "protected_tags": protected_tags}]
-            if h in protected_hashes or any(tags(t).intersection(p.get("protected_tags", protected_tags)) for p in effective):
+            if h in protected_hashes or effective_tags.intersection(always_protected_tags) or any(effective_tags.intersection(p.get("protected_tags", protected_tags)) for p in effective):
                 reason = "H&R或保护标签"
                 break
             try:
@@ -192,7 +194,7 @@ def build_plan(rows, files, min_hours, protected_hashes=(), protected_tags=(),
             required_hours = max(p["min_seed_hours"] for p in effective)
             seed_time = optional_number(t.get("seeding_time")) or 0
             owner_rules = [match_rules(t, complete, p["min_seed_hours"], p["inactive_hours"], now, p,
-                                       h in hr_hashes, promotion_expiries.get(h)) for p in effective]
+                                       h in hr_hashes or bool(tags(t) & hr_tags), promotion_expiries.get(h)) for p in effective]
             rules = sorted({rule for matches in owner_rules for rule in matches}) if all(owner_rules) else []
             if not rules:
                 reason = "自身或关联辅种未满足清理条件"
@@ -323,10 +325,11 @@ def execute(plugin):
         protected, managed = protected_brush_hashes(plugin, downloader_name)
         protected.update(t["hash"] for t in rows if "刷流" in tags(t) and t["hash"] not in managed)
         hr_hashes, expiries = policy_metadata(plugin, downloader_name)
+        helper_tags = configured_hr_tags()
         return build_plan(rows, files, min_hours, protected, protected_tags, required,
                           task_policies=policies_by_hash(plugin, downloader_name),
                           inactive_hours=inactive_hours, policy=policy,
-                          hr_hashes=hr_hashes, promotion_expiries=expiries)
+                          promotion_expiries=expiries, always_protected_tags=helper_tags)
 
     plan = current()
     report = {"revision": REVISION, "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),

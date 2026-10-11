@@ -5,6 +5,17 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
+class BrushTaskOrderPayload(BaseModel):
+    ids: list[str]
+
+
+def reorder_tasks(tasks, ids):
+    """与自动订阅一致：完整 ID 列表重排，不修改任务对象。"""
+    if len(ids) != len(tasks) or len(set(ids)) != len(ids) or set(ids) != set(tasks):
+        raise ValueError('任务列表已变化，请刷新后重新排序')
+    return {task_id: tasks[task_id] for task_id in ids}
+
+
 def _normalize_optional_positive_number(value):
     """把历史配置中的空值和 0 统一转换为未设置。"""
     if value is None or value == "":
@@ -49,6 +60,8 @@ class BrushTaskPayload(BaseModel):
     min_seed_hours: Optional[float] = Field(None, gt=0, allow_inf_nan=False)
     seed_time: Optional[float] = Field(None, gt=0)
     hr_seed_time: Optional[float] = Field(None, gt=0)
+    hr_seed_ratio: Optional[float] = Field(None, ge=0, allow_inf_nan=False)
+    hr_ratio_basis: Literal['client', 'full_size'] = 'client'
     seed_ratio: Optional[float] = Field(None, gt=0)
     seed_size: Optional[float] = Field(None, gt=0)
     download_time: Optional[float] = Field(None, gt=0)
@@ -60,6 +73,8 @@ class BrushTaskPayload(BaseModel):
     auto_archive_days: Optional[float] = Field(None, gt=0)
     save_path: Optional[str] = None
     delete_except_tags: Optional[str] = None
+    dedupe_hash: bool = True
+    dedupe_site_id: bool = True
     except_subscribe: bool = True
     proxy_delete: bool = False
     del_no_free: Optional[bool] = None
@@ -190,6 +205,8 @@ class BrushFlowSettingsPayload(BaseModel):
     global_hr_seed_time: Optional[float] = Field(None, gt=0, allow_inf_nan=False)
     global_del_no_free: bool = False
     global_delete_except_tags: str = "MOVIEPILOT,H&R"
+    global_hr_guard_enabled: bool = False
+    global_hr_tags: str = ""
     global_inactive_hours: Optional[float] = Field(None, gt=0, allow_inf_nan=False)
     global_min_seed_hours: Optional[float] = Field(None, gt=0, allow_inf_nan=False)
     enabled: bool = True
