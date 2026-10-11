@@ -28,11 +28,11 @@ class TorrentTransfer(_PluginBase):
     # 插件图标
     plugin_icon = "seed.png"
     # 插件版本
-    plugin_version = "1.10.3"
+    plugin_version = "1.10.5"
     # 插件作者
-    plugin_author = "jxxghp"
+    plugin_author = "seiun, jxxghp"
     # 作者主页
-    author_url = "https://github.com/jxxghp"
+    author_url = "https://github.com/zhangyxXyz/MoviePilot-Plugins"
     # 插件配置项ID前缀
     plugin_config_prefix = "torrenttransfer_"
     # 加载顺序
@@ -65,6 +65,7 @@ class TorrentTransfer(_PluginBase):
     _add_torrent_tags = None
     _remainoldcat = False
     _remainoldtag = False
+    _preserve_tag_names = ""
     # 退出事件
     _event = Event()
     # 待检查种子清单
@@ -99,6 +100,7 @@ class TorrentTransfer(_PluginBase):
             self._torrent_tags = self._add_torrent_tags.strip().split(",") if self._add_torrent_tags else []
             self._remainoldcat = config.get("remainoldcat")
             self._remainoldtag = config.get("remainoldtag")
+            self._preserve_tag_names = config.get("preserve_tag_names") or ""
 
         # 停止现有任务
         self.stop_service()
@@ -535,32 +537,44 @@ class TorrentTransfer(_PluginBase):
                             },
                             {
                                 'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 3
-                                },
+                                'props': {'cols': 12},
                                 'content': [
                                     {
                                         'component': 'VSwitch',
                                         'props': {
                                             'model': 'remainoldcat',
                                             'label': '保留原分类',
+                                            'hide-details': True,
                                         }
+                                    },
+                                    {
+                                        'component': 'div',
+                                        'props': {'class': 'text-caption text-medium-emphasis mt-1'},
+                                        'text': '转入 Transmission 时，将原分类转换为“分类/原分类”标签。',
                                     }
                                 ]
                             },
                             {
                                 'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 3
-                                },
+                                'props': {'cols': 12},
                                 'content': [
                                     {
                                         'component': 'VSwitch',
                                         'props': {
                                             'model': 'remainoldtag',
                                             'label': '保留原标签',
+                                            'hide-details': True,
+                                        }
+                                    },
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'preserve_tag_names',
+                                            'label': '仅保留这些原标签',
+                                            'class': 'mt-3',
+                                            'placeholder': 'H&R,保留,勿删',
+                                            'hint': '开启保留原标签后生效，留空保留全部。多个标签用逗号分隔，按名称精确匹配，不影响分类标签和转移后新增标签。',
+                                            'persistent-hint': True,
                                         }
                                     }
                                 ]
@@ -590,7 +604,8 @@ class TorrentTransfer(_PluginBase):
             "transferemptylabel": False,
             "add_torrent_tags": "已整理,转移做种",
             "remainoldcat": False,
-            "remainoldtag": False
+            "remainoldtag": False,
+            "preserve_tag_names": ""
         }
 
     def get_page(self) -> List[dict]:
@@ -611,6 +626,27 @@ class TorrentTransfer(_PluginBase):
             return False
         return True
 
+    @staticmethod
+    def __split_tag_names(value: str) -> List[str]:
+        """解析配置中的标签名称，兼容中文逗号并保持顺序。"""
+        return list(dict.fromkeys(
+            name.strip() for name in (value or "").replace("，", ",").split(",") if name.strip()
+        ))
+
+    def __transfer_labels(self, torrent: Any, source_type: str, category_label: bool) -> List[str]:
+        """筛选原标签后合并转移标签；TR 的分类映射独立于原标签开关。"""
+        labels = []
+        if self._remainoldtag:
+            allowed = set(self.__split_tag_names(self._preserve_tag_names))
+            source_labels = self.__get_label(torrent, source_type)
+            labels.extend(label for label in source_labels if not allowed or label in allowed)
+        labels.extend(self._torrent_tags)
+        if category_label and self._remainoldcat:
+            category = self.__get_category(torrent, source_type)
+            if category:
+                labels.append(f"分类/{category}")
+        return list(dict.fromkeys(label.strip() for label in labels if label and label.strip()))
+
     def __download(self, service: ServiceInfo, content: bytes,
                    save_path: str, torrent: TorrentDictionary) -> Optional[str]:
         """
@@ -624,12 +660,8 @@ class TorrentTransfer(_PluginBase):
         if downloader_helper.is_downloader("qbittorrent", service=service):
             # 生成随机Tag
             tag = StringUtils.generate_random_str(10)
-            if self._remainoldtag:
-                # 获取种子标签
-                torrent_labels = self.__get_label(torrent, from_service.type)
-                new_tag = list(set(torrent_labels + self._torrent_tags + [tag]))
-            else:
-                new_tag = self._torrent_tags + [tag]
+            new_tag = self.__transfer_labels(torrent, from_service.type, category_label=False)
+            new_tag.append(tag)
             if self._remainoldcat:
                 # 获取种子分类
                 torrent_category = self.__get_category(torrent, from_service.type)
@@ -652,12 +684,7 @@ class TorrentTransfer(_PluginBase):
             return torrent_hash
         elif downloader_helper.is_downloader("transmission", service=service):
             # 添加任务
-            if self._remainoldtag:
-                # 获取种子标签
-                torrent_labels = self.__get_label(torrent, from_service.type)
-                new_tag = list(set(torrent_labels + self._torrent_tags))
-            else:
-                new_tag = self._torrent_tags
+            new_tag = self.__transfer_labels(torrent, from_service.type, category_label=True)
             torrent = downloader.add_torrent(content=content,
                                              download_dir=save_path,
                                              is_paused=True,
@@ -1005,7 +1032,7 @@ class TorrentTransfer(_PluginBase):
         获取种子标签
         """
         try:
-            return [str(tag).strip() for tag in torrent.get("tags").split(',')] \
+            return [str(tag).strip() for tag in (torrent.get("tags") or "").split(',')] \
                 if dl_type == "qbittorrent" else torrent.labels or []
         except Exception as e:
             print(str(e))
@@ -1017,7 +1044,7 @@ class TorrentTransfer(_PluginBase):
         获取种子分类
         """
         try:
-            return torrent.get("category").strip() \
+            return (torrent.get("category") or "").strip() \
                 if dl_type == "qbittorrent" else ""
         except Exception as e:
             print(str(e))

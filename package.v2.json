@@ -280,11 +280,13 @@
     "name": "自动转移做种",
     "description": "定期转移下载器中的做种任务到另一个下载器。",
     "labels": "做种",
-    "version": "1.10.3",
+    "version": "1.10.5",
     "icon": "seed.png",
-    "author": "jxxghp",
+    "author": "seiun, jxxghp",
     "level": 2,
     "history": {
+      "v1.10.5": "调整分类和标签配置布局，分类开关独占一行，原标签开关与保留名单相邻展示。",
+      "v1.10.4": "转入 Transmission 时将原分类映射为分类标签；支持精确保留指定原标签，留空保留全部。",
       "v1.10.3": "更新依赖库",
       "v1.10.2": "增加保留原标签和原分类的选项",
       "v1.10.1": "优化“立即运行一次”按钮位置",
@@ -293,7 +295,8 @@
       "v1.8": "支持qbittorrent 5",
       "v1.7": "MoviePilot V2 版本自动转移做种插件",
       "v1.7.1": "修复兼容性问题"
-    }
+    },
+    "author_url": "https://github.com/zhangyxXyz/MoviePilot-Plugins"
   },
   "RssSubscribe": {
     "v3": false,
