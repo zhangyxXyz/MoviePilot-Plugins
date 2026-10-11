@@ -30,7 +30,8 @@ const task=computed(()=>tasks.value.find(t=>t.id===selected.value))
 const visibleTasks=computed(()=>tasks.value.filter(t=>!sourceFilter.value||t.source===sourceFilter.value))
 const runtime=computed(()=>state.value.runtime[selected.value]||{})
 const busy=computed(()=>['queued','running'].includes(runtime.value.status))
-const rows=computed(()=>state.value.records.filter(r=>(!selected.value||r.task_id===selected.value)&&(!sourceFilter.value||r.source===sourceFilter.value)&&(tab.value!=='pending'||!statusFilter.value||r.status===statusFilter.value)&&(!kindFilter.value||r.media_type===kindFilter.value)&&(!search.value||String(r.title||'').includes(search.value))))
+const matchesOrigin=(r,taskId='',source='')=>(r.origins||[r]).some(o=>(!taskId||o.task_id===taskId)&&(!source||o.source===source))
+const rows=computed(()=>state.value.records.filter(r=>matchesOrigin(r,selected.value,sourceFilter.value)&&(tab.value!=='pending'||!statusFilter.value||r.status===statusFilter.value)&&(!kindFilter.value||r.media_type===kindFilter.value)&&(!search.value||String(r.title||'').includes(search.value))))
 const history=computed(()=>rows.value.filter(r=>['subscribed','migrated'].includes(r.status)))
 const completed=computed(()=>rows.value.filter(r=>r.status==='completed'))
 const pending=computed(()=>rows.value.filter(r=>!['subscribed','migrated','completed'].includes(r.status)))
@@ -39,7 +40,7 @@ const paged=computed(()=>displayed.value.slice((page.value-1)*24,page.value*24))
 const runs=computed(()=>state.value.runs.filter(r=>!selected.value||r.task_id===selected.value).slice().reverse())
 const sourceOptions=Object.entries(sources).map(([value,title])=>({value,title}))
 const kindOptions=[{title:'全部',value:'all'},{title:'电影',value:'movie'},{title:'电视剧',value:'tv'},{title:'动漫剧集',value:'anime'}]
-const count=(id)=>state.value.records.filter(r=>r.task_id===id&&['subscribed','migrated','completed'].includes(r.status)).length
+const count=(id)=>state.value.records.filter(r=>matchesOrigin(r,id)&&['subscribed','migrated','completed'].includes(r.status)).length
 let timer
 watch([selected,tab,sourceFilter,statusFilter,kindFilter,search],()=>page.value=1)
 watch(sourceFilter,()=>{if(task.value && sourceFilter.value && task.value.source!==sourceFilter.value)selected.value=''})
@@ -56,7 +57,7 @@ async function move(id,delta){const i=tasks.value.findIndex(t=>t.id===id),other=
 async function run(preview){try{await post(`/tasks/${selected.value}/${preview?'preview':'run'}`);tab.value=preview?'preview':'runs';info.value=preview?'预览已排队，不会创建订阅':'扫描已排队'}catch{}}
 async function remove(){try{unwrap(await props.api.delete(`${base.value}/tasks/${selected.value}`));deleteOpen.value=false;selected.value='';await refresh();info.value='任务已删除，已有订阅和历史保留'}catch(e){error.value=errorText(e)}}
 async function saveSettings(){try{await post('/settings',settingsDraft.value);settingsOpen.value=false;info.value='设置已保存'}catch{}}
-async function rowAction(row,action){try{await post('/history/'+action,{ids:[row.id]});info.value=action==='hide'?'展示记录已隐藏，去重记录保留':'已加入下轮重试'}catch{}}
+async function rowAction(row,action){try{await post('/history/'+action,{ids:action==='hide'?(row.record_ids||[row.id]):[row.id]});info.value=action==='hide'?'展示记录已隐藏，去重记录保留':'已加入下轮重试'}catch{}}
 const safeLink=x=>/^https?:\/\//.test(x||'')?x:undefined
 const posterUrl=x=>safeLink(x)?`/api/v1/system/img/0?imgurl=${encodeURIComponent(x)}&cache=true`:undefined
 onMounted(async()=>{await refresh();await nextTick();measureFullPage();sizeObserver=new ResizeObserver(measureFullPage);if(contentElement.value)sizeObserver.observe(contentElement.value);timer=setInterval(()=>refresh(true),5000)})
@@ -69,7 +70,7 @@ onUnmounted(()=>{clearInterval(timer);sizeObserver?.disconnect()})
   <VAlert v-if="info" type="success" variant="tonal" closable class="mb-3" @click:close="info=''">{{info}}</VAlert>
   <div class="layout" :style="{'--full-page-height':fullPageHeight+'px'}">
     <div class="task-rail-frame"><aside class="task-sidebar"><VSelect v-model="sourceFilter" :items="[{title:'全部来源',value:''},...sourceOptions]" label="来源分类" hide-details density="compact" class="mb-3"/>
-      <button class="all-history" :class="{active:!selected}" @click="selected='';tab='history'">全部订阅历史 <span>{{state.records.filter(r=>['subscribed','migrated','completed'].includes(r.status)&&(!sourceFilter||r.source===sourceFilter)).length}}</span></button>
+      <button class="all-history" :class="{active:!selected}" @click="selected='';tab='history'">全部订阅历史 <span>{{state.records.filter(r=>['subscribed','migrated','completed'].includes(r.status)&&matchesOrigin(r,'',sourceFilter)).length}}</span></button>
       <div class="task-scroll soft-scrollbar" tabindex="0" aria-label="自动订阅任务列表">
       <div v-for="(t,index) in visibleTasks" :key="t.id" class="task-card" :class="{active:selected===t.id}" draggable="true" @dragstart="dragged=t.id" @dragover.prevent @drop.prevent="sortTo(dragged,t.id);dragged=''" @click="selected=t.id;tab='history'" @keydown.enter="selected=t.id" tabindex="0" role="button" :aria-label="t.name">
         <div class="task-heading"><VIcon size="18" class="muted">mdi-drag-vertical</VIcon><strong :title="t.name">{{t.name}}</strong><VChip size="x-small" :color="t.enabled?'success':'default'">{{t.enabled?'启用':'停用'}}</VChip></div>
@@ -95,7 +96,7 @@ onUnmounted(()=>{clearInterval(timer);sizeObserver?.disconnect()})
       <div v-if="tab==='runs'" class="run-list"><div v-for="(r,i) in runs" :key="i" class="run-row"><strong>{{r.task_name}}</strong><VChip size="small">{{r.preview?'预览':'订阅扫描'}}</VChip><span>{{dateTime(r.started_at)}}</span><span>{{r.error||`扫描 ${r.scanned||0} 部，新增 ${r.added||0} 部`}}</span><span>{{({done:'完成',failed:'失败',stopped:'已停止'})[r.status]||r.status}}</span></div><p v-if="!runs.length" class="empty">暂无运行记录</p></div>
       <div v-else class="media-results"><div class="media-grid"><article v-for="r in paged" :key="r.id" class="media-card">
         <div class="poster-wrap"><a class="poster-link" :href="safeLink(r.detail_link)" target="_blank" rel="noopener noreferrer"><img v-if="posterUrl(r.poster)&&!failedPosters.has(r.poster)" class="auto-poster-image" :src="posterUrl(r.poster)" :alt="r.title||'影视海报'" loading="lazy" @error="failedPosters.add(r.poster)"/><div v-else class="poster-placeholder"><VIcon size="36">mdi-movie-outline</VIcon><span>暂无海报</span></div></a><span class="poster-status" :class="{positive:['subscribed','migrated','completed','eligible'].includes(r.status)}">{{statuses[r.status]||r.status}}</span><span v-if="r.douban_rating||r.tmdb_rating" class="poster-rating">{{r.douban_rating?'豆瓣':'TMDB'}} {{r.douban_rating||r.tmdb_rating}}</span></div>
-        <div class="media-body"><strong :title="r.title">{{r.title||'待识别作品'}}</strong><div class="media-meta"><span>{{r.year||'年份待确认'}}{{r.season?` · 第 ${r.season} 季`:''}}</span><span v-if="r.popularity">{{r.popularity}} 人订阅</span></div><p v-if="!['subscribed','migrated','completed'].includes(r.status)" class="media-reason" :title="r.reason">{{r.reason}}</p><div class="media-footer"><span class="media-origin" :title="`${r.task_name} · ${r.legacy_time||dateTime(r.time)}`">{{r.task_name==='迁移历史'?sources[r.source]:(r.task_name||sources[r.source])}}</span><div v-if="tab!=='preview'" class="media-actions"><VBtn v-if="['retry','waiting','filtered','limited'].includes(r.status)" size="x-small" variant="text" icon="mdi-refresh" aria-label="下轮重试" @click="rowAction(r,'retry')"/><VBtn size="x-small" variant="text" icon="mdi-eye-off-outline" aria-label="隐藏记录" @click="rowAction(r,'hide')"/></div></div></div>
+        <div class="media-body"><strong :title="r.title">{{r.title||'待识别作品'}}</strong><div class="media-meta"><span>{{r.year||'年份待确认'}}{{r.season?` · 第 ${r.season} 季`:''}}</span><span v-if="r.popularity">{{r.popularity}} 人订阅</span></div><p v-if="!['subscribed','migrated','completed'].includes(r.status)" class="media-reason" :title="r.reason">{{r.reason}}</p><div class="media-footer"><span class="media-origin" :title="`${r.task_name} · ${r.legacy_time||dateTime(r.time)}`">{{task?.name||(r.task_name==='迁移历史'?sources[r.source]:(r.task_name||sources[r.source]))}}</span><div v-if="tab!=='preview'" class="media-actions"><VBtn v-if="['retry','waiting','filtered','limited'].includes(r.status)" size="x-small" variant="text" icon="mdi-refresh" aria-label="下轮重试" @click="rowAction(r,'retry')"/><VBtn size="x-small" variant="text" icon="mdi-eye-off-outline" aria-label="隐藏记录" @click="rowAction(r,'hide')"/></div></div></div>
       </article></div><p v-if="!displayed.length" class="empty">{{tab==='preview'?'点击预览，查看当前规则会选中哪些作品':'暂无记录'}}</p><VPagination v-if="displayed.length>24" v-model="page" :length="Math.ceil(displayed.length/24)" :total-visible="5"/></div>
     </main>
   </div>

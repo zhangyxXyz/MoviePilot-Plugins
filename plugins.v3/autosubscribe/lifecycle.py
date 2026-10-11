@@ -37,6 +37,7 @@ def snapshot():
 
 def project(records, active, completed):
     rows = []
+    groups = {}
     for record in records:
         row = {k: v for k, v in record.items() if k != 'candidate'}
         key = identity(row)
@@ -50,5 +51,19 @@ def project(records, active, completed):
             row.update(status='completed', reason='扫描时已确认媒体库完整存在')
         elif row.get('status') in ('migrated', 'existing'):
             row.update(status='subscribed')
+        # 扫描记录按任务保存，历史卡片按确切媒体身份展示。
+        # 保留所有底层记录和来源，筛选、计数与隐藏仍能覆盖全部任务。
+        row['record_ids'] = [row['id']] if row.get('id') else []
+        row['origins'] = [dict(task_id=row.get('task_id'), task_name=row.get('task_name'), source=row.get('source'))]
+        group_key = (key, row.get('status')) if key and row.get('status') in ('subscribed', 'completed') else None
+        previous = groups.get(group_key) if group_key else None
+        if previous is not None:
+            for field in ('record_ids', 'origins'):
+                for value in row[field]:
+                    if value not in previous[field]:
+                        previous[field].append(value)
+            continue
+        if group_key:
+            groups[group_key] = row
         rows.append(row)
     return rows

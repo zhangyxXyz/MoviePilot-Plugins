@@ -39,6 +39,27 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(project([dict(row, status='library')], {key: {'id': 9}}, {})[0]['status'], 'subscribed')
         self.assertEqual(project([dict(row, status='filtered')], {key: {'id': 9}}, {})[0]['status'], 'subscribed')
 
+    def test_history_deduplicates_old_and_rescanned_records_without_mutation(self):
+        from auto_candidate.lifecycle import identity, project
+        movie = dict(media_source='themoviedb', media_id='1231322', media_type='movie', title='流浪地球3', task_id='popular-movie', source='popular')
+        records = [dict(movie, id='new', status='duplicate'), dict(movie, id='old', status='migrated'), dict(movie, id='other', task_id='douban-quality', source='douban', status='existing')]
+        original = copy.deepcopy(records)
+        rows = project(records, {identity(movie): {'id': 75}}, {})
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['subscription_id'], 75)
+        self.assertEqual(rows[0]['record_ids'], ['new', 'old', 'other'])
+        self.assertEqual([o['task_id'] for o in rows[0]['origins']], ['popular-movie', 'douban-quality'])
+        self.assertEqual(records, original)
+        done = project(records, {}, {identity(movie): {'id': 75}})
+        self.assertEqual(len(done), 1)
+        self.assertEqual(done[0]['status'], 'completed')
+
+    def test_history_does_not_merge_unknown_identity_seasons_or_pending(self):
+        from auto_candidate.lifecycle import project
+        base = dict(media_source='themoviedb', media_id='1', media_type='movie', title='同名', status='subscribed')
+        records = [base, dict(base, media_id='2'), dict(base, media_type='tv', season=1), dict(base, media_type='tv', season=2), dict(base, media_type='tv', season=None), dict(base, media_type='tv', season=None), dict(base, status='retry'), dict(base, status='filtered'), dict(base, media_type='tv', season=1, episode_group='alternate')]
+        self.assertEqual(len(project(records, {}, {})), len(records))
+
     def test_pagination_and_host_identity(self):
         from auto_candidate.lifecycle import identity, read_index
         from types import SimpleNamespace

@@ -21,7 +21,7 @@ class AutoSubscribe(_PluginBase):
     plugin_name = '自动订阅'
     plugin_desc = '按多套任务管理热门媒体、豆瓣榜单、演员作品、将映关注和豆瓣想看，统一去重与分类历史。'
     plugin_icon = 'movie.jpg'
-    plugin_version = '1.1.2'
+    plugin_version = '1.1.3'
     plugin_author = 'seiun'
     author_url = 'https://github.com/zhangyxXyz/MoviePilot-Plugins'
     plugin_config_prefix = 'autosubscribe_'
