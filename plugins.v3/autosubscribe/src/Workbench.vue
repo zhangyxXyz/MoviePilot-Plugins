@@ -61,7 +61,7 @@ onUnmounted(()=>clearInterval(timer))
         <p class="muted small">下次运行 {{dateTime(state.next_runs[t.id])}}</p><p class="muted small">最近运行 {{dateTime(taskRuntime(t.id).finished_at)}}</p>
         <div class="card-bottom"><span class="small">{{({running:'正在扫描',queued:'已排队',failed:'等待重试',done:'最近运行完成'})[taskRuntime(t.id).status]||'等待运行'}}</span><div><VBtn size="x-small" variant="text" icon="mdi-arrow-up" aria-label="上移任务" :disabled="tasks[0]?.id===t.id||saving" @click.stop="move(t.id,-1)"/><VBtn size="x-small" variant="text" icon="mdi-arrow-down" aria-label="下移任务" :disabled="tasks.at(-1)?.id===t.id||saving" @click.stop="move(t.id,1)"/><VBtn size="x-small" variant="text" icon="mdi-pencil" aria-label="编辑任务" @click.stop="openEditor(t)"/></div></div>
       </div>
-      <p class="muted small mt-3">拖动卡片或使用上下箭头排序，编辑任务不会改变位置。</p>
+      <p class="muted small mt-3">拖动卡片或使用上下箭头排序</p>
     </aside>
     <main>
       <div class="detail-heading"><div><h3>{{task?.name||'全部订阅历史'}}</h3><p class="muted">{{task?`${sources[task.source]}，独立规则和执行周期`:'可按来源、媒体类型和处理状态筛选'}}</p></div><div v-if="task" class="actions"><VBtn variant="tonal" :disabled="busy||saving" @click="run(true)">预览</VBtn><VBtn color="primary" :disabled="busy||saving||!task.enabled||!state.config.enabled" @click="run(false)">立即运行</VBtn><VBtn icon="mdi-pencil" variant="text" aria-label="编辑当前任务" :disabled="busy" @click="openEditor(task)"/><VBtn icon="mdi-delete-outline" variant="text" aria-label="删除任务" :disabled="busy" @click="deleteOpen=true"/></div></div>
