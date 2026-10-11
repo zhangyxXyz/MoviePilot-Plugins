@@ -1003,5 +1003,19 @@
     "author_url": "https://github.com/zhangyxXyz/MoviePilot-Plugins",
     "v3": true,
     "system_version": ">=3.0.0"
+  },
+  "AutoSubscribe": {
+    "name": "自动订阅",
+    "description": "多任务管理热门媒体、豆瓣榜单、演员作品和将映关注，支持排序和分类历史。",
+    "version": "1.0.0",
+    "icon": "movie.jpg",
+    "author": "seiun",
+    "author_url": "https://github.com/zhangyxXyz/MoviePilot-Plugins",
+    "level": 1,
+    "v3": true,
+    "system_version": ">=3.1.2",
+    "history": {
+      "v1.0.0": "统一四种自动订阅来源，支持稳定任务排序、豆瓣评分筛选和旧数据迁移。"
+    }
   }
 }
