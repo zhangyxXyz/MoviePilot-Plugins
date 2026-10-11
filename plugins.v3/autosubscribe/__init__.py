@@ -11,6 +11,7 @@ from app.sdk.logging import logger
 from app.sdk.scheduler import add_plugin_once_job, remove_plugin_once_job, update_plugin_job
 from .models import Task, Settings, TaskOrder, HistoryAction, SOURCES, RANKS, save_task, reorder
 from .engine import Engine
+from .lifecycle import snapshot, project
 from .gateway import Gateway
 from .migration import LEGACY, migrate, migrate_wish
 
@@ -21,7 +22,7 @@ class AutoSubscribe(_PluginBase):
     plugin_name = '自动订阅'
     plugin_desc = '按多套任务管理热门媒体、豆瓣榜单、演员作品、将映关注和豆瓣想看，统一去重与分类历史。'
     plugin_icon = 'movie.jpg'
-    plugin_version = '1.1.0'
+    plugin_version = '1.1.1'
     plugin_author = 'seiun'
     author_url = 'https://github.com/zhangyxXyz/MoviePilot-Plugins'
     plugin_config_prefix = 'autosubscribe_'
@@ -33,6 +34,8 @@ class AutoSubscribe(_PluginBase):
         self._config, self._runtime = {}, {}
         self._stop = threading.Event()
         self._pending = set()
+        self._lifecycle_at = 0
+        self._lifecycle = ({}, {})
 
     def init_plugin(self, config=None):
         self.stop_service()
@@ -93,7 +96,13 @@ class AutoSubscribe(_PluginBase):
             records = [r for r in (self.get_data('records') or {}).values() if not r.get('hidden')]
             records.sort(key=lambda r: r.get('time', 0), reverse=True)
             # 不向界面传回重试候选的内部快照。
-            rows = [{k: v for k, v in r.items() if k != 'candidate'} for r in records]
+            if time.monotonic() - self._lifecycle_at >= 60:
+                try:
+                    self._lifecycle = snapshot()
+                except Exception as err:
+                    logger.warning(f'自动订阅状态同步暂未完成：{type(err).__name__}')
+                self._lifecycle_at = time.monotonic()
+            rows = project(records, *self._lifecycle)
             next_runs = {}
             from datetime import datetime
             import pytz

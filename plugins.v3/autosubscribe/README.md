@@ -31,3 +31,5 @@ MoviePilot V3 插件，侧栏入口为「订阅 → 自动订阅」。统一管�
 前端运行 `npm ci`、`npm run build` 和 `npm test`。后端测试为 `tests/v3/autosubscribe/test_core.py`，需要 MoviePilot Python 环境。插件使用 Vue 联邦模块，管理接口要求宿主管理权限。
 
 实现参考了 MoviePilot 以及 jxxghp、thsrite、boeto 维护的对应插件行为，新界面和统一执行器由本仓库实现。原项目许可证见仓库 LICENSE。
+
+订阅历史会关联 MoviePilot 当前订阅及完成历史，每分钟刷新状态。已创建的统一显示“已创建订阅”，宿主完成历史或扫描确认媒体库完整存在的条目进入“已完成”。同一作品按媒体类型和季度分别匹配，仍在进行的订阅（包括洗版）优先显示为已创建。删除订阅不会被当作完成。此分类不修改宿主订阅或原始扫描记录。

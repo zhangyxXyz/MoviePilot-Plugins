@@ -20,6 +20,38 @@ class Gateway:
         if item['media_id'] in self.fail: raise RuntimeError('transient')
         self.added.append(media_key(item));return len(self.added)
 
+class LifecycleTest(unittest.TestCase):
+    def test_completion_requires_exact_type_and_season(self):
+        from auto_candidate.lifecycle import identity, project
+        movie = dict(media_source='themoviedb', media_id='1', media_type='movie', status='migrated')
+        season = dict(movie, media_type='tv', season=2)
+        done = {identity(season): {'id': 1, 'date': '2026-10-12'}}
+        rows = project([movie, season, dict(season, season=1), dict(season, season=None)], {}, done)
+        self.assertEqual([r['status'] for r in rows], ['subscribed', 'completed', 'subscribed', 'subscribed'])
+        self.assertEqual(season['status'], 'migrated')
+
+    def test_active_wash_takes_precedence_and_missing_is_not_complete(self):
+        from auto_candidate.lifecycle import identity, project
+        row = dict(media_source='themoviedb', media_id='1', media_type='movie', status='subscribed')
+        key = identity(row)
+        self.assertEqual(project([row], {key: {'id': 9}}, {key: {'id': 2}})[0]['status'], 'subscribed')
+        self.assertEqual(project([row], {}, {})[0]['status'], 'subscribed')
+        self.assertEqual(project([dict(row, status='library')], {}, {})[0]['status'], 'completed')
+        self.assertEqual(project([dict(row, status='library')], {key: {'id': 9}}, {})[0]['status'], 'subscribed')
+        self.assertEqual(project([dict(row, status='filtered')], {key: {'id': 9}}, {})[0]['status'], 'subscribed')
+
+    def test_pagination_and_host_identity(self):
+        from auto_candidate.lifecycle import identity, read_index
+        from types import SimpleNamespace
+        calls = []
+        def query(page):
+            calls.append(page['page'])
+            return SimpleNamespace(items=[SimpleNamespace(model_dump=lambda: dict(media_source='themoviedb', media_id=str(page['page']), type='电视剧', season=1, id=page['page']))], has_next=page['page'] < 2)
+        index = read_index(query)
+        self.assertEqual(calls, [1, 2])
+        self.assertEqual(len(index), 2)
+        self.assertIn(identity(dict(media_source='themoviedb', media_id='2', media_type='tv', season=1)), index)
+
 class CoreTest(unittest.TestCase):
     def setUp(self):
         self.data={};self.task=Task(id='one',name='测试',source='douban',media_type='movie',min_rating=8,max_add=1).model_dump()
