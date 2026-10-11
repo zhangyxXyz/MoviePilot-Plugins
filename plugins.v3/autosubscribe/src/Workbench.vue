@@ -1,10 +1,27 @@
 <script setup>
-import {ref,computed,onMounted,onUnmounted,watch} from 'vue'
+import {ref,computed,onMounted,onUnmounted,watch,nextTick} from 'vue'
 import {sources,statuses,dateTime,unwrap,errorText,lines,draft,orderedIds} from './utils'
 const props=defineProps({api:{type:Object,default:()=>({})},pluginId:{type:String,default:'AutoSubscribe'}})
 const emit=defineEmits(['action'])
 const state=ref({config:{enabled:false,tasks:[]},records:[],runs:[],runtime:{},plans:{},next_runs:{},ranks:{}})
 const failedPosters=ref(new Set())
+const contentElement=ref(null),fullPageHeight=ref(1600)
+let sizeObserver,lastContentWidth=0,cardBodyHeight=88,contentHeaderHeight=184,paginationHeight=72
+function measureFullPage(){
+  if(window.matchMedia('(max-width:850px)').matches){lastContentWidth=0;return}
+  const el=contentElement.value
+  if(!el)return
+  const width=el.clientWidth
+  if(!width||Math.abs(width-lastContentWidth)<1)return
+  lastContentWidth=width
+  const grid=el.querySelector('.media-grid'),card=grid?.querySelector('.media-card')
+  if(card){cardBodyHeight=card.querySelector('.media-body').getBoundingClientRect().height;contentHeaderHeight=grid.getBoundingClientRect().top-el.getBoundingClientRect().top}
+  const pagination=el.querySelector('.v-pagination')
+  if(pagination)paginationHeight=pagination.getBoundingClientRect().height
+  const columns=Math.max(1,Math.floor((width+16)/206)),rows=Math.ceil(24/columns)
+  const cardWidth=(width-(columns-1)*16)/columns
+  fullPageHeight.value=Math.ceil(contentHeaderHeight+rows*((cardWidth-2)*1.25+cardBodyHeight+2)+(rows-1)*16+paginationHeight)
+}
 const selected=ref(''),tab=ref('history'),sourceFilter=ref(''),statusFilter=ref(''),kindFilter=ref(''),search=ref('')
 const loading=ref(false),saving=ref(false),error=ref(''),info=ref(''),editor=ref(false),editing=ref(draft()),textActors=ref(''),textTitles=ref(''),textUrls=ref(''),dragged=ref(''),page=ref(1)
 const settingsOpen=ref(false),settingsDraft=ref({}),deleteOpen=ref(false)
@@ -42,15 +59,15 @@ async function saveSettings(){try{await post('/settings',settingsDraft.value);se
 async function rowAction(row,action){try{await post('/history/'+action,{ids:[row.id]});info.value=action==='hide'?'展示记录已隐藏，去重记录保留':'已加入下轮重试'}catch{}}
 const safeLink=x=>/^https?:\/\//.test(x||'')?x:undefined
 const posterUrl=x=>safeLink(x)?`/api/v1/system/img/0?imgurl=${encodeURIComponent(x)}&cache=true`:undefined
-onMounted(async()=>{await refresh();timer=setInterval(()=>refresh(true),5000)})
-onUnmounted(()=>clearInterval(timer))
+onMounted(async()=>{await refresh();await nextTick();measureFullPage();sizeObserver=new ResizeObserver(measureFullPage);if(contentElement.value)sizeObserver.observe(contentElement.value);timer=setInterval(()=>refresh(true),5000)})
+onUnmounted(()=>{clearInterval(timer);sizeObserver?.disconnect()})
 </script>
 <template>
 <div class="auto-workbench">
   <div class="toolbar"><div><h2>自动订阅</h2><p class="muted">热门媒体、豆瓣榜单、演员作品、将映关注和豆瓣想看</p></div><div class="actions"><VBtn variant="text" icon="mdi-refresh" aria-label="刷新" @click="refresh()"/><VBtn variant="tonal" @click="settingsDraft={enabled:state.config.enabled,show_sidebar:state.config.show_sidebar};settingsOpen=true">设置</VBtn></div></div>
   <VAlert v-if="error" type="error" variant="tonal" closable class="mb-3" @click:close="error=''">{{error}}</VAlert>
   <VAlert v-if="info" type="success" variant="tonal" closable class="mb-3" @click:close="info=''">{{info}}</VAlert>
-  <div class="layout">
+  <div class="layout" :style="{'--full-page-height':fullPageHeight+'px'}">
     <div class="task-rail-frame"><aside class="task-sidebar"><VSelect v-model="sourceFilter" :items="[{title:'全部来源',value:''},...sourceOptions]" label="来源分类" hide-details density="compact" class="mb-3"/>
       <button class="all-history" :class="{active:!selected}" @click="selected='';tab='history'">全部订阅历史 <span>{{state.records.filter(r=>['subscribed','migrated','completed'].includes(r.status)&&(!sourceFilter||r.source===sourceFilter)).length}}</span></button>
       <div class="task-scroll soft-scrollbar" tabindex="0" aria-label="自动订阅任务列表">
@@ -68,7 +85,7 @@ onUnmounted(()=>clearInterval(timer))
       </div>
       <div class="task-create"><VBtn block color="primary" variant="tonal" prepend-icon="mdi-plus" @click="openEditor()">新建任务</VBtn></div>
     </aside></div>
-    <main class="task-content">
+    <main ref="contentElement" class="task-content">
       <div class="detail-heading"><div><h3>{{task?.name||'全部订阅历史'}}</h3><p class="muted">{{task?`${sources[task.source]}，独立规则和执行周期`:'可按来源、媒体类型和处理状态筛选'}}</p></div><div v-if="task" class="actions"><VBtn variant="tonal" :disabled="busy||saving" @click="run(true)">预览</VBtn><VBtn color="primary" :disabled="busy||saving||!task.enabled||!state.config.enabled" @click="run(false)">立即运行</VBtn><VBtn icon="mdi-pencil" variant="text" aria-label="编辑当前任务" :disabled="busy" @click="openEditor(task)"/><VBtn icon="mdi-delete-outline" variant="text" aria-label="删除任务" :disabled="busy" @click="deleteOpen=true"/></div></div>
       <VAlert v-if="runtime.error" type="warning" variant="tonal" class="my-2">{{runtime.error}}</VAlert>
       <VProgressLinear v-if="busy" indeterminate color="primary" class="my-3"/>
@@ -96,7 +113,7 @@ onUnmounted(()=>clearInterval(timer))
 </div>
 </template>
 <style scoped>
-.task-rail-frame{position:relative;min-height:440px}.task-sidebar{position:absolute;inset:0;display:flex;flex-direction:column;min-height:0;overflow:hidden}.task-sidebar>.v-input,.task-sidebar>.all-history,.task-create{flex:0 0 auto}.task-scroll{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;padding-right:4px;scrollbar-gutter:stable}.task-scroll .task-card:last-child{margin-bottom:0}.task-create{padding-top:12px}.task-content{min-height:440px;overflow:visible}.soft-scrollbar{scrollbar-width:thin;scrollbar-color:transparent transparent;overscroll-behavior-y:contain}.soft-scrollbar:hover,.soft-scrollbar:focus-within{scrollbar-color:rgba(var(--v-theme-on-surface),.25) transparent}.soft-scrollbar::-webkit-scrollbar{width:6px}.soft-scrollbar::-webkit-scrollbar-track{background:transparent}.soft-scrollbar::-webkit-scrollbar-thumb{background:transparent;border-radius:999px}.soft-scrollbar:hover::-webkit-scrollbar-thumb,.soft-scrollbar:focus-within::-webkit-scrollbar-thumb{background:rgba(var(--v-theme-on-surface),.25)}@media(hover:none){.soft-scrollbar{scrollbar-color:rgba(var(--v-theme-on-surface),.2) transparent}.soft-scrollbar::-webkit-scrollbar-thumb{background:rgba(var(--v-theme-on-surface),.2)}}
+.task-rail-frame{position:relative;height:var(--full-page-height);min-height:440px;align-self:start}.task-sidebar{position:absolute;inset:0;display:flex;flex-direction:column;min-height:0;overflow:hidden}.task-sidebar>.v-input,.task-sidebar>.all-history,.task-create{flex:0 0 auto}.task-scroll{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;padding-right:4px;scrollbar-gutter:stable}.task-scroll .task-card:last-child{margin-bottom:0}.task-create{padding-top:12px}.task-content{min-height:var(--full-page-height);overflow:visible}.soft-scrollbar{scrollbar-width:thin;scrollbar-color:transparent transparent;overscroll-behavior-y:contain}.soft-scrollbar:hover,.soft-scrollbar:focus-within{scrollbar-color:rgba(var(--v-theme-on-surface),.25) transparent}.soft-scrollbar::-webkit-scrollbar{width:6px}.soft-scrollbar::-webkit-scrollbar-track{background:transparent}.soft-scrollbar::-webkit-scrollbar-thumb{background:transparent;border-radius:999px}.soft-scrollbar:hover::-webkit-scrollbar-thumb,.soft-scrollbar:focus-within::-webkit-scrollbar-thumb{background:rgba(var(--v-theme-on-surface),.25)}@media(hover:none){.soft-scrollbar{scrollbar-color:rgba(var(--v-theme-on-surface),.2) transparent}.soft-scrollbar::-webkit-scrollbar-thumb{background:rgba(var(--v-theme-on-surface),.2)}}
 
 .task-pill{display:inline-block;justify-self:start;max-width:100%;min-width:0;padding:2px 8px;border-radius:999px;background:rgba(var(--v-theme-primary),.09);border:1px solid rgba(var(--v-theme-primary),.12);color:rgb(var(--v-theme-on-surface));font-size:11px;line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
