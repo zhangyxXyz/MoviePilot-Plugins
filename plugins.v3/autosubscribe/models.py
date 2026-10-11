@@ -5,7 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 from apscheduler.triggers.cron import CronTrigger
 
-SOURCES = {'popular': '热门媒体', 'douban': '豆瓣榜单', 'actor': '演员作品', 'release': '将映关注'}
+SOURCES = {'popular': '热门媒体', 'douban': '豆瓣榜单', 'actor': '演员作品', 'release': '将映关注', 'wish': '豆瓣想看'}
 RANKS = {'movie-weekly': '电影口碑榜', 'movie-ustop': '北美票房榜', 'movie-real-time': '实时热门电影',
          'show-domestic': '国产剧榜', 'movie-hot-gaia': '热门电影', 'tv-hot': '热门剧集',
          'movie-top250': '电影 Top250', 'movie-top250-full': '完整电影 Top250'}
@@ -13,7 +13,7 @@ RANKS = {'movie-weekly': '电影口碑榜', 'movie-ustop': '北美票房榜', 'm
 class Task(BaseModel):
     id: str = Field(default_factory=lambda: uuid.uuid4().hex, pattern=r'^[a-zA-Z0-9_-]{1,80}$')
     name: str = Field(min_length=1, max_length=100)
-    source: Literal['popular', 'douban', 'actor', 'release']
+    source: Literal['popular', 'douban', 'actor', 'release', 'wish']
     enabled: bool = False
     cron: str = '0 9 * * *'
     media_type: Literal['all', 'movie', 'tv', 'anime'] = 'all'
@@ -26,6 +26,8 @@ class Task(BaseModel):
     ranks: list[str] = Field(default_factory=list)
     rss_urls: list[str] = Field(default_factory=list)
     actors: list[str] = Field(default_factory=list)
+    douban_user: str = Field(default='', pattern=r'^[a-zA-Z0-9_.-]*$')
+    wish_days: int = Field(default=7, ge=1, le=365)
     titles: list[str] = Field(default_factory=list)
     release_mode: Literal['recognized', 'near_release'] = 'recognized'
     release_days: int = Field(default=30, ge=0, le=365)

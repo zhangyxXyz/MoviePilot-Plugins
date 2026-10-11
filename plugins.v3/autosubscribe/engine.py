@@ -39,8 +39,8 @@ def filter_reason(task, item):
     if task['source'] == 'popular' and int(item.get('popularity') or 0) < task['min_popularity']:
         return 'filtered', '订阅人次尚未达到门槛'
     # 豆瓣任务绝不回退到 TMDB 评分。
-    field = 'douban_rating' if task['source'] == 'douban' else 'tmdb_rating'
-    votes = 'douban_votes' if task['source'] == 'douban' else 'tmdb_votes'
+    field = 'douban_rating' if task['source'] in ('douban', 'wish') else 'tmdb_rating'
+    votes = 'douban_votes' if task['source'] in ('douban', 'wish') else 'tmdb_votes'
     if task['min_rating']:
         if not item.get(field):
             return 'retry', '暂无豆瓣评分' if field == 'douban_rating' else '暂无 TMDB 评分'

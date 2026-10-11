@@ -101,3 +101,37 @@ def migrate(snapshot):
     return {'tasks': tasks, 'records': records, 'ledger': ledger, 'legacy_processed': raw_processed,
             'report': {pid: {'history': len((value.get('data') or {}).get('history') or []),
                              'processed': len(raw_processed.get(pid) or [])} for pid, value in snapshot.items()}}
+
+
+def migrate_wish(snapshot):
+    """独立增量迁移，不覆盖已经建立的其他来源任务和历史。"""
+    c, data = snapshot.get('config') or {}, snapshot.get('data') or {}
+    users = split(c.get('users'))
+    tasks, records, ledger = [], {}, {}
+    for index, user in enumerate(users):
+        uid = hashlib.sha256(str(user).encode()).hexdigest()[:12]
+        tasks.append(Task(id='wish-'+uid, name='我的豆瓣想看' if len(users) == 1 else f'豆瓣想看 {index+1}',
+                          source='wish', douban_user=str(user), wish_days=int(c.get('days') or 7),
+                          enabled=False, cron='0,30 * * * *', media_type='all', scan_limit=50, max_add=5,
+                          legacy_plugin='DoubanSync').model_dump())
+    for index, old in enumerate(data.get('history') or []):
+        if not isinstance(old, dict):
+            continue
+        identity=hashlib.sha256(f'DoubanSync:{index}:{old.get("media_id",old.get("doubanid", ""))}'.encode()).hexdigest()[:24]
+        kind = 'movie' if old.get('type') in ('movie', '电影') else 'tv'
+        mid = str(old.get('media_id') or old.get('doubanid') or '')
+        source = old.get('media_source') or 'douban'
+        status = 'migrated' if old.get('action') in ('subscribe', 'download') else 'legacy'
+        row = {'id':'mw-'+identity, 'task_id':tasks[0]['id'] if len(tasks)==1 else 'legacy-wish',
+               'task_name':tasks[0]['name'] if len(tasks)==1 else '豆瓣想看', 'source':'wish',
+               'media_source':source, 'media_id':mid, 'media_type':kind,
+               'season':old.get('season') or (1 if kind=='tv' else None), 'title':old.get('title'),
+               'year':old.get('year'), 'poster':old.get('poster'), 'overview':old.get('overview'),
+               'detail_link':'https://movie.douban.com/subject/'+mid if mid else None,
+               'status':status, 'reason':'已订阅' if status=='migrated' else '旧版已处理记录',
+               'legacy_time':old.get('time'), 'time':time.time()}
+        records[row['id']] = row
+        if status=='migrated' and media_key(row):
+            ledger[media_key(row)]={'task_ids':[row['task_id']], 'status':status, 'time':time.time()}
+    return {'tasks':tasks, 'records':records, 'ledger':ledger,
+            'report':{'accounts':len(users), 'history':len(records), 'was_enabled':bool(c.get('enabled'))}}

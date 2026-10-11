@@ -109,4 +109,31 @@ class GatewayTest(unittest.TestCase):
         from auto_candidate.gateway import parse_rss
         with self.assertRaises(ValueError): parse_rss('<!DOCTYPE rss><rss/>')
 
+class WishTest(unittest.TestCase):
+    def test_only_recent_wishes_are_imported(self):
+        from datetime import datetime, timezone
+        from auto_candidate.gateway import parse_wish
+        xml='<rss><channel>'
+        for title,day,id_ in [('想看 新电影','10','1'),('看过 老电影','10','2'),('在看 连续剧','10','3'),('想看 过期作品','01','4')]:
+            xml+=f'<item><title>{title}</title><link>https://movie.douban.com/subject/{id_}/</link><pubDate>Sat, {day} Oct 2026 00:00:00 GMT</pubDate></item>'
+        xml+='</channel></rss>'
+        items=parse_wish(xml,7,datetime(2026,10,12,tzinfo=timezone.utc))
+        self.assertEqual([x['title'] for x in items],['新电影'])
+    def test_wishes_do_not_require_a_rating_by_default(self):
+        task=Task(name='想看',source='wish',douban_user='person123').model_dump()
+        item={'media_source':'themoviedb','media_id':'2','media_type':'movie','title':'无评分作品'}
+        self.assertEqual(filter_reason(task,item)[0],'eligible')
+        task['min_rating']=8;item['tmdb_rating']=9
+        self.assertEqual(filter_reason(task,item)[0],'retry')
+    def test_wish_migration_is_stable_and_disabled_until_cutover(self):
+        from auto_candidate.migration import migrate_wish
+        old={'config':{'users':'example','enabled':True,'days':7},'data':{'history':[]}}
+        a=migrate_wish(old);b=migrate_wish(old)
+        self.assertEqual(a['tasks'],b['tasks'])
+        self.assertFalse(a['tasks'][0]['enabled'])
+        self.assertEqual(a['tasks'][0]['cron'],'0,30 * * * *')
+        self.assertTrue(a['report']['was_enabled'])
+    def test_wish_task_rejects_url_as_account_id(self):
+        with self.assertRaises(ValueError):Task(name='想看',source='wish',douban_user='https://example.com')
+
 if __name__=='__main__': unittest.main()

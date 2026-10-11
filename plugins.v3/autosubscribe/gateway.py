@@ -44,6 +44,36 @@ def parse_rss(xml):
     return result
 
 
+def parse_wish(xml, days, now=None):
+    """只接受近期的明确想看动态，看过、在看及其他动态不导入。"""
+    from datetime import datetime, timezone
+    from email.utils import parsedate_to_datetime
+    now = now or datetime.now(timezone.utc)
+    if '<!DOCTYPE' in xml.upper() or '<!ENTITY' in xml.upper():
+        raise ValueError('不支持含外部实体的 RSS')
+    root = ElementTree.fromstring(xml)
+    items = []
+    for node in root.findall('.//item'):
+        title = node.findtext('title', '').strip()
+        if not title.startswith('想看'):
+            continue
+        match = re.search(r'douban\.com/subject/(\d+)', node.findtext('link', ''))
+        if not match:
+            continue
+        pubdate = node.findtext('pubDate', '')
+        if pubdate:
+            try:
+                published = parsedate_to_datetime(pubdate)
+                if published.tzinfo is None:
+                    published = published.replace(tzinfo=timezone.utc)
+                if (now - published).total_seconds() > days * 86400:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        items.append({'title': title[2:].strip(), 'douban_id': match[1], 'wish_date': pubdate})
+    return items
+
+
 class Gateway:
     def __init__(self, stopped=lambda: False, load=lambda key: None, save=lambda key, value: None):
         self.media, self.download, self.subs, self.tmdb = MediaChain(), DownloadChain(), SubscribeChain(), TmdbChain()
@@ -215,6 +245,27 @@ class Gateway:
                     yield self.resolve_douban(item)
                 except Exception as err:
                     yield {**item, 'error': f'该条媒体详情暂不可用（{type(err).__name__}），下轮重试'}
+
+    def wish(self, task):
+        user = task.get('douban_user', '').strip()
+        if not user:
+            raise ValueError('请填写豆瓣账号 ID')
+        url = 'https://www.douban.com/feed/people/' + user + '/interests'
+        cache_key = 'wish_' + hashlib.sha256(user.encode()).hexdigest()[:16]
+        cached = self.load(cache_key) or {}
+        xml = cached.get('xml') if time.time() - cached.get('time', 0) < 300 else None
+        if not xml:
+            response = RequestUtils(timeout=30, ua=settings.USER_AGENT).get_res(url)
+            if response is None or response.status_code != 200:
+                raise ValueError('豆瓣账号动态暂不可用，请确认账号和公开权限，稍后重试')
+            xml = response.text
+            parse_wish(xml, task['wish_days'])
+            self.save(cache_key, {'time': time.time(), 'xml': xml})
+        for item in parse_wish(xml, task['wish_days']):
+            try:
+                yield {**self.resolve_douban(item), 'wish_user': user, 'wish_date': item.get('wish_date')}
+            except Exception as err:
+                yield {**item, 'wish_user': user, 'error': f'想看作品暂未识别（{type(err).__name__}），下轮重试'}
 
     def resolve_douban(self, item):
         if self._douban_blocked:

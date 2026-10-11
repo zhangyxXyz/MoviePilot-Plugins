@@ -1,4 +1,4 @@
-"""自动订阅：热门媒体、豆瓣榜单、演员作品和将映关注。"""
+"""自动订阅：热门媒体、豆瓣榜单、演员作品、将映关注和豆瓣想看。"""
 import copy
 import threading
 import time
@@ -12,16 +12,16 @@ from app.sdk.scheduler import add_plugin_once_job, remove_plugin_once_job, updat
 from .models import Task, Settings, TaskOrder, HistoryAction, SOURCES, RANKS, save_task, reorder
 from .engine import Engine
 from .gateway import Gateway
-from .migration import LEGACY, migrate
+from .migration import LEGACY, migrate, migrate_wish
 
 _LOCK = threading.RLock()
 _RUN_LOCK = threading.Lock()
 
 class AutoSubscribe(_PluginBase):
     plugin_name = '自动订阅'
-    plugin_desc = '按多套任务管理热门媒体、豆瓣榜单、演员作品和将映关注，统一去重与分类历史。'
+    plugin_desc = '按多套任务管理热门媒体、豆瓣榜单、演员作品、将映关注和豆瓣想看，统一去重与分类历史。'
     plugin_icon = 'movie.jpg'
-    plugin_version = '1.0.0'
+    plugin_version = '1.1.0'
     plugin_author = 'seiun'
     author_url = 'https://github.com/zhangyxXyz/MoviePilot-Plugins'
     plugin_config_prefix = 'autosubscribe_'
@@ -64,7 +64,7 @@ class AutoSubscribe(_PluginBase):
                   ('/tasks/{task_id}', self.task_delete, 'DELETE'),
                   ('/tasks/{task_id}/preview', self.preview, 'POST'), ('/tasks/{task_id}/run', self.execute, 'POST'),
                   ('/history/hide', self.history_hide, 'POST'), ('/history/retry', self.history_retry, 'POST'),
-                  ('/migration', self.migration, 'POST')]
+                  ('/migration', self.migration, 'POST'), ('/migration/wish', self.wish_migration, 'POST')]
         return [{'path': p, 'endpoint': fn, 'methods': [m], 'auth': 'bear', 'summary': fn.__doc__} for p, fn, m in routes]
 
     def get_service(self):
@@ -103,7 +103,7 @@ class AutoSubscribe(_PluginBase):
                     next_runs[t['id']] = CronTrigger.from_crontab(t['cron'], timezone=settings.TZ).get_next_fire_time(None, now).timestamp()
             return {'config': copy.deepcopy(self._config), 'records': rows, 'runtime': copy.deepcopy(self._runtime),
                     'plans': self.get_data('plans') or {}, 'runs': self.get_data('runs') or [], 'next_runs': next_runs,
-                    'sources': SOURCES, 'ranks': RANKS, 'migration': self.get_data('migration_report')}
+                    'sources': SOURCES, 'ranks': RANKS, 'migration': self.get_data('migration_report'), 'wish_migration': self.get_data('wish_migration_report')}
 
     def settings_save(self, payload: Settings, _: object = Depends(get_current_active_manage_user)):
         """保存全局开关，保留任务和顺序。"""
@@ -241,4 +241,23 @@ class AutoSubscribe(_PluginBase):
                 tasks = save_task(tasks, task)
             self._persist({**self._config, 'tasks': tasks})
             self.save_data('migration_report', result['report'])
+            return {'success': True, 'data': result['report']}
+
+    def wish_migration(self, _: object = Depends(get_current_active_manage_user)):
+        """增量导入豆瓣想看，新增任务默认停用，避免与旧插件同时运行。"""
+        with _RUN_LOCK, _LOCK:
+            report = self.get_data('wish_migration_report')
+            if report:
+                return {'success': True, 'data': report}
+            snapshot = {'config': PluginManager().get_plugin_config('DoubanSync') or {},
+                        'data': {'history': self.get_data('history', plugin_id='DoubanSync') or []}}
+            self.save_data('wish_legacy_backup', snapshot)
+            result = migrate_wish(snapshot)
+            self.save_data('records', {**(self.get_data('records') or {}), **result['records']})
+            self.save_data('ledger', {**(self.get_data('ledger') or {}), **result['ledger']})
+            tasks = self._config['tasks']
+            for task in result['tasks']:
+                tasks = save_task(tasks, task)
+            self._persist({**self._config, 'tasks': tasks})
+            self.save_data('wish_migration_report', result['report'])
             return {'success': True, 'data': result['report']}
