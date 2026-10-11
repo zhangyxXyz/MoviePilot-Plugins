@@ -10,7 +10,6 @@ PACKAGE=ROOT/'plugins.v3/autosubscribe'
 pkg=types.ModuleType('auto_candidate');pkg.__path__=[str(PACKAGE)];sys.modules[pkg.__name__]=pkg
 from auto_candidate.models import Task, save_task, reorder
 from auto_candidate.engine import Engine, media_key, filter_reason
-from auto_candidate.migration import migrate
 
 class Gateway:
     def __init__(self, items): self.items=items;self.added=[];self.existing={};self.fail=set()
@@ -94,11 +93,6 @@ class CoreTest(unittest.TestCase):
     def test_stale_order_rejected(self):
         with self.assertRaises(ValueError): reorder([self.task],['missing'])
         with self.assertRaises(ValueError): reorder([self.task],['one','one'])
-    def test_migration_preserves_raw_processed_and_season(self):
-        snapshot={'PopularSubscribe':{'config':{'movie_enabled':True},'data':{'already_handle':['tmdb:1'], 'history':[{'title':'旧剧','type':'电视剧','media_source':'themoviedb','media_id':'2','season':'第二季'}]}}}
-        result=migrate(snapshot);r=next(iter(result['records'].values()))
-        self.assertEqual(r['season'],2);self.assertEqual(r['task_id'],'legacy-popular');self.assertEqual(result['legacy_processed']['PopularSubscribe'],['tmdb:1'])
-        self.assertEqual(set(result['records']),set(migrate(snapshot)['records']))
     def test_missing_votes_waits(self):
         self.task['min_votes']=1000;self.assertEqual(filter_reason(self.task,self.item)[0],'retry')
     def test_stopping_prevents_add(self):
@@ -157,14 +151,6 @@ class WishTest(unittest.TestCase):
         self.assertEqual(filter_reason(task,item)[0],'eligible')
         task['min_rating']=8;item['tmdb_rating']=9
         self.assertEqual(filter_reason(task,item)[0],'retry')
-    def test_wish_migration_is_stable_and_disabled_until_cutover(self):
-        from auto_candidate.migration import migrate_wish
-        old={'config':{'users':'example','enabled':True,'days':7},'data':{'history':[]}}
-        a=migrate_wish(old);b=migrate_wish(old)
-        self.assertEqual(a['tasks'],b['tasks'])
-        self.assertFalse(a['tasks'][0]['enabled'])
-        self.assertEqual(a['tasks'][0]['cron'],'0,30 * * * *')
-        self.assertTrue(a['report']['was_enabled'])
     def test_wish_task_rejects_url_as_account_id(self):
         with self.assertRaises(ValueError):Task(name='想看',source='wish',douban_user='https://example.com')
 

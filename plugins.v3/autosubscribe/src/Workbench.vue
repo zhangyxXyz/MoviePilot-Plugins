@@ -7,7 +7,7 @@ const state=ref({config:{enabled:false,tasks:[]},records:[],runs:[],runtime:{},p
 const failedPosters=ref(new Set())
 const selected=ref(''),tab=ref('history'),sourceFilter=ref(''),statusFilter=ref(''),kindFilter=ref(''),search=ref('')
 const loading=ref(false),saving=ref(false),error=ref(''),info=ref(''),editor=ref(false),editing=ref(draft()),textActors=ref(''),textTitles=ref(''),textUrls=ref(''),dragged=ref(''),page=ref(1)
-const settingsOpen=ref(false),settingsDraft=ref({}),deleteOpen=ref(false),migrationBusy=ref(false)
+const settingsOpen=ref(false),settingsDraft=ref({}),deleteOpen=ref(false)
 const base=computed(()=>`plugin/${props.pluginId}`),tasks=computed(()=>state.value.config.tasks)
 const task=computed(()=>tasks.value.find(t=>t.id===selected.value))
 const visibleTasks=computed(()=>tasks.value.filter(t=>!sourceFilter.value||t.source===sourceFilter.value))
@@ -37,8 +37,6 @@ async function move(id,delta){const i=tasks.value.findIndex(t=>t.id===id),other=
 async function run(preview){try{await post(`/tasks/${selected.value}/${preview?'preview':'run'}`);tab.value=preview?'preview':'runs';info.value=preview?'预览已排队，不会创建订阅':'扫描已排队'}catch{}}
 async function remove(){try{unwrap(await props.api.delete(`${base.value}/tasks/${selected.value}`));deleteOpen.value=false;selected.value='';await refresh();info.value='任务已删除，已有订阅和历史保留'}catch(e){error.value=errorText(e)}}
 async function saveSettings(){try{await post('/settings',settingsDraft.value);settingsOpen.value=false;info.value='设置已保存'}catch{}}
-async function migrateWish(){migrationBusy.value=true;try{await post('/migration/wish');info.value='豆瓣想看已导入，新任务默认停用，请先停用旧插件再启用'}catch{}finally{migrationBusy.value=false}}
-async function migrate(){migrationBusy.value=true;try{await post('/migration');info.value='旧插件数据已迁移，可在全部历史中查看'}catch{}finally{migrationBusy.value=false}}
 async function rowAction(row,action){try{await post('/history/'+action,{ids:[row.id]});info.value=action==='hide'?'展示记录已隐藏，去重记录保留':'已加入下轮重试'}catch{}}
 const safeLink=x=>/^https?:\/\//.test(x||'')?x:undefined
 const posterUrl=x=>safeLink(x)?`/api/v1/system/img/0?imgurl=${encodeURIComponent(x)}&cache=true`:undefined
@@ -64,7 +62,6 @@ onUnmounted(()=>clearInterval(timer))
     </aside>
     <main>
       <div class="detail-heading"><div><h3>{{task?.name||'全部订阅历史'}}</h3><p class="muted">{{task?`${sources[task.source]}，独立规则和执行周期`:'可按来源、媒体类型和处理状态筛选'}}</p></div><div v-if="task" class="actions"><VBtn variant="tonal" :disabled="busy||saving" @click="run(true)">预览</VBtn><VBtn color="primary" :disabled="busy||saving||!task.enabled||!state.config.enabled" @click="run(false)">立即运行</VBtn><VBtn icon="mdi-pencil" variant="text" aria-label="编辑当前任务" :disabled="busy" @click="openEditor(task)"/><VBtn icon="mdi-delete-outline" variant="text" aria-label="删除任务" :disabled="busy" @click="deleteOpen=true"/></div></div>
-      <VAlert v-if="task?.migration_note" type="warning" variant="tonal" class="my-2">{{task.migration_note}}</VAlert>
       <VAlert v-if="runtime.error" type="warning" variant="tonal" class="my-2">{{runtime.error}}</VAlert>
       <VProgressLinear v-if="busy" indeterminate color="primary" class="my-3"/>
       <VTabs v-model="tab" color="primary"><VTab value="history">订阅历史</VTab><VTab value="completed">已完成</VTab><VTab value="pending">待处理与跳过</VTab><VTab v-if="task" value="preview">预览结果</VTab><VTab value="runs">运行记录</VTab></VTabs>
@@ -86,7 +83,7 @@ onUnmounted(()=>clearInterval(timer))
     <div class="form-grid mt-4"><VTextField v-model.number="editing.min_year" type="number" label="最低年份" hint="0 表示不限"/><VTextField v-model.number="editing.min_rating" type="number" min="0" max="10" step="0.1" :label="['douban','wish'].includes(editing.source)?'最低豆瓣评分':'最低 TMDB 评分'" hint="0 表示不按评分筛选"/><VTextField v-model.number="editing.min_votes" type="number" label="最低评分人数" hint="0 表示不限"/><VSelect v-model="editing.season_mode" :items="[{title:'明确季度优先，否则第 1 季',value:'first'},{title:'未指定季度时检查全部正片季',value:'all'}]" label="剧集季度"/><VTextField v-model.number="editing.scan_limit" type="number" label="每次扫描作品数"/><VTextField v-model.number="editing.max_add" type="number" label="每次最多新增订阅" hint="重复、失败和跳过不占新增额度" persistent-hint/><VSelect v-model="editing.release_mode" :items="[{title:'识别后订阅',value:'recognized'},{title:'临近上映才订阅',value:'near_release'}]" label="订阅时机"/><VTextField v-if="editing.release_mode==='near_release'" v-model.number="editing.release_days" type="number" label="提前多少天关注上映" hint="已上映作品也会检查"/></div><VTextField v-model="editing.save_path" label="下载保存目录" hint="留空使用 MoviePilot 默认目录" persistent-hint/>
     <p class="muted mt-3">修改后保持原卡片位置和历史，新的条件从下一轮扫描生效。</p>
   </VCardText><VCardActions><VSpacer/><VBtn @click="editor=false">取消</VBtn><VBtn color="primary" :loading="saving" :disabled="!editing.name.trim()" @click="save">保存</VBtn></VCardActions></VCard></VDialog>
-  <VDialog v-model="settingsOpen" max-width="550"><VCard title="自动订阅设置"><VCardText><VSwitch v-model="settingsDraft.enabled" label="启用插件" color="primary"/><VSwitch v-model="settingsDraft.show_sidebar" label="在订阅分组显示侧栏入口" color="primary"/><p class="muted">关闭插件后可以预览，任务不会创建新订阅，已有订阅继续由 MoviePilot 管理。</p><VDivider class="my-4"/><h4>旧插件数据迁移</h4><p class="muted my-2">导入热门媒体、豆瓣榜单、演员作品、将映关注和豆瓣想看的配置与历史，原始数据保留备份。重复迁移不会重复导入。</p><VBtn variant="tonal" :disabled="state.config.enabled||!!state.migration" :loading="migrationBusy" @click="migrate">{{state.migration?'迁移已完成':'迁移旧插件数据'}}</VBtn><VBtn variant="text" class="mt-2" :disabled="!!state.wish_migration" :loading="migrationBusy" @click="migrateWish">{{state.wish_migration?'豆瓣想看已迁移':'导入豆瓣想看'}}</VBtn><div v-if="state.migration" class="mt-3 small"><p v-for="(v,k) in state.migration" :key="k">{{k}}：历史 {{v.history}} 条，已处理 {{v.processed}} 条</p></div></VCardText><VCardActions><VSpacer/><VBtn @click="settingsOpen=false">取消</VBtn><VBtn color="primary" :loading="saving" @click="saveSettings">保存</VBtn></VCardActions></VCard></VDialog>
+  <VDialog v-model="settingsOpen" max-width="550"><VCard title="自动订阅设置"><VCardText><VSwitch v-model="settingsDraft.enabled" label="启用插件" color="primary"/><VSwitch v-model="settingsDraft.show_sidebar" label="在订阅分组显示侧栏入口" color="primary"/><p class="muted">关闭插件后可以预览，任务不会创建新订阅，已有订阅继续由 MoviePilot 管理。</p></VCardText><VCardActions><VSpacer/><VBtn @click="settingsOpen=false">取消</VBtn><VBtn color="primary" :loading="saving" @click="saveSettings">保存</VBtn></VCardActions></VCard></VDialog>
   <VDialog v-model="deleteOpen" max-width="420"><VCard title="删除此任务？"><VCardText>已有订阅和历史会保留，该任务不再自动运行。</VCardText><VCardActions><VSpacer/><VBtn @click="deleteOpen=false">取消</VBtn><VBtn color="error" @click="remove">删除任务</VBtn></VCardActions></VCard></VDialog>
 </div>
 </template>

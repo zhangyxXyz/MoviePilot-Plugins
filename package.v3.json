@@ -1007,7 +1007,7 @@
   "AutoSubscribe": {
     "name": "自动订阅",
     "description": "多任务管理热门媒体、豆瓣榜单、演员作品、将映关注和豆瓣想看，支持排序和分类历史。",
-    "version": "1.1.1",
+    "version": "1.1.2",
     "icon": "movie.jpg",
     "author": "seiun",
     "author_url": "https://github.com/zhangyxXyz/MoviePilot-Plugins",
@@ -1015,6 +1015,7 @@
     "v3": true,
     "system_version": ">=3.1.2",
     "history": {
+      "v1.1.2": "移除旧插件数据迁移入口与逻辑，优化卡片布局和设置",
       "v1.1.1": "关联宿主订阅状态，新增已完成分类，改善任务编辑间距",
       "v1.1.0": "新增按账号同步豆瓣想看，支持近期动态筛选、独立任务和增量迁移。",
       "v1.0.0": "统一四种自动订阅来源，支持稳定任务排序、豆瓣评分筛选和旧数据迁移。"

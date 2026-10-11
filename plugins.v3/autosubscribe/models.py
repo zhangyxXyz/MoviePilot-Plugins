@@ -33,8 +33,6 @@ class Task(BaseModel):
     release_days: int = Field(default=30, ge=0, le=365)
     season_mode: Literal['first', 'all'] = 'first'
     save_path: str = ''
-    legacy_plugin: str = ''
-    migration_note: str = ''
 
     @field_validator('cron')
     @classmethod
