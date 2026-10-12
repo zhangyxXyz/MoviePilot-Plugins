@@ -326,7 +326,7 @@ class TorrentCleanup(_PluginBase):
                 # 消费过的计划不能被重复手动执行。
                 plans.pop(task_id, None)
                 self.save_data("plans", plans)
-                if task.notify:
+                if task.notify and any(item.get("status") == "confirmed" for item in report.get("items", [])):
                     title, text = execution_notification(task, report)
                     self.post_message(title=title, text=text)
             self._runtime[task_id] = {**self._runtime[task_id], "status": "idle", "message": "检查完成",
